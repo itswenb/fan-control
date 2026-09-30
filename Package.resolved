@@ -1,0 +1,24 @@
+{
+  "originHash" : "c09696a2d0f30093e3e3f6c63d1c274c346a361e0c66c2a7db8253640104c3d9",
+  "pins" : [
+    {
+      "identity" : "siliconscope",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kennss/SiliconScope.git",
+      "state" : {
+        "revision" : "2184b46f11b983eee44bd34be9eec6cf0cbb4bfa",
+        "version" : "4.4.0"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle",
+      "state" : {
+        "revision" : "eef1a539a373c1f1a320624b1130fc5de7b2e100",
+        "version" : "2.10.0"
+      }
+    }
+  ],
+  "version" : 3
+}

@@ -1,0 +1,35 @@
+# 构建产物与系统文件
+.build/
+build/
+.DS_Store
+*.xcresult
+
+# 本机工具配置与任务记录
+.planning/
+.skills/
+.agents/
+.codex/
+.tokensave/
+.idea/
+.gitmodules
+
+# 说明文档只追踪项目根目录的 README
+docs/
+*.md
+!/README.md
+
+# Xcode 个人配置；共享工程与 scheme 继续追踪
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# 本机凭据与签名材料
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile

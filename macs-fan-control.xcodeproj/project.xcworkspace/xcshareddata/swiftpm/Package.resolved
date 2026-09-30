@@ -1,0 +1,33 @@
+{
+  "originHash" : "3bf56f5b87b5b038acedb65e8dddbc522e90d7138a7b48e4af5b1f2f64d24e2d",
+  "pins" : [
+    {
+      "identity" : "devicehardware",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Shakshi3104/DeviceHardware.git",
+      "state" : {
+        "revision" : "1a12f5098d387b85e8f9e80a97af242b867b2269",
+        "version" : "3.7.1"
+      }
+    },
+    {
+      "identity" : "siliconscope",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kennss/SiliconScope.git",
+      "state" : {
+        "revision" : "2184b46f11b983eee44bd34be9eec6cf0cbb4bfa",
+        "version" : "4.4.0"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle",
+      "state" : {
+        "revision" : "eef1a539a373c1f1a320624b1130fc5de7b2e100",
+        "version" : "2.10.0"
+      }
+    }
+  ],
+  "version" : 3
+}
