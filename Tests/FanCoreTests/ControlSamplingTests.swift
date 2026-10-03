@@ -95,6 +95,21 @@ struct ControlSamplingTests {
         #expect(hidCalls == 0)
     }
 
+    @Test func libraryIOFTTemperatureKeysRemainUsableForControl() throws {
+        let smc = MemorySMC()
+        // 上游在 Apple Silicon 上确认的 ioft 温度格式，34.20°C。
+        smc.values["TG0B"] = ("ioft", [0x33, 0x33, 0x22, 0, 0, 0, 0, 0])
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let sources = [ControlTemperatureSource(id: "TG0B", group: .other, keys: ["TG0B"])]
+        let snapshot = try device.controlSnapshot(temperatureSources: sources)
+        #expect(abs((snapshot.sensors[0].celsius ?? 0) - 34.2) < 0.001)
+        #expect(SMCCodec.decode(type: "ioft", bytes: [0, 0]) == nil)
+        let session = try ControlSession(driver: device, journal: SamplingJournal())
+        try session.apply([FanPolicy(fanID: "F0", mode: .sensor, sensorID: "TG0B", low: 30, high: 50)],
+                          temperatureSources: sources, client: UUID(), uptime: 10, now: Date())
+        #expect(!session.status.policies.isEmpty)
+    }
+
     @Test(arguments: [Double.nan, 6, 130])
     func missingOrInvalidAverageMemberReturnsControlToAutomatic(value: Double) throws {
         let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()

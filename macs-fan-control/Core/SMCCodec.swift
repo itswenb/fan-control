@@ -24,6 +24,11 @@ public enum SMCCodec {
         case "fpe2":
             guard bytes.count == 2 else { return nil }
             value = Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1])) / 4
+        case "ioft":
+            // 与 SiliconScopeCore 一致：64 位小端有符号定点数，16 位小数。
+            guard bytes.count == 8 else { return nil }
+            let bits = bytes.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
+            value = Double(Int64(bitPattern: bits)) / 65_536
         case "ui8 ":
             guard bytes.count == 1 else { return nil }
             value = Double(bytes[0])

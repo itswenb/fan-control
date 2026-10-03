@@ -90,14 +90,14 @@ gh secret set SPARKLE_PRIVATE_KEY --repo itswenb/fan-control < .secrets/sparkle.
 本地生成已签名的发布产物：
 
 ```sh
-FANCONTROL_VERSION=0.3.2 bash scripts/build-release.sh
+FANCONTROL_VERSION=0.3.3 bash scripts/build-release.sh
 ```
 
-产物位于 `build/releases/`，包含 `FanControl-0.3.2.dmg` 和带签名的 `appcast.xml`。脚本检查版本、公私钥匹配、签名、篡改拒绝和下载地址。准备好 Actions Secret 后，推送对应版本标签即可触发发布：
+产物位于 `build/releases/`，包含 `FanControl-0.3.3.dmg` 和带签名的 `appcast.xml`。脚本检查版本、公私钥匹配、签名、篡改拒绝和下载地址。准备好 Actions Secret 后，推送对应版本标签即可触发发布：
 
 ```sh
-git tag v0.3.2
-git push origin main v0.3.2
+git tag v0.3.3
+git push origin main v0.3.3
 ```
 
 首次发布更新功能后，使用旧版且尚未包含 Sparkle 的用户需要手动安装一次，之后可在应用内更新。
