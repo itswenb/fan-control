@@ -4,6 +4,17 @@ import Foundation
 import Observation
 import ServiceManagement
 import UniformTypeIdentifiers
+#if SWIFT_PACKAGE
+import FanCore
+import FanHardware
+#endif
+
+protocol HardwareSampling: Sendable {
+    func sample() async throws -> HardwareSnapshot
+    func reset() async
+}
+
+extension SMCReader: HardwareSampling {}
 
 enum AppLanguage: String, Codable, CaseIterable { case system, chinese, english }
 enum MenuDisplay: String, Codable, CaseIterable { case none, temperature, fan, both }
@@ -88,9 +99,10 @@ final class AppStore {
         }
     }
 
-    @ObservationIgnored private let reader = SMCReader()
+    @ObservationIgnored private let reader: any HardwareSampling
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var clockTask: Task<Void, Never>?
+    @ObservationIgnored private var sleepRestoreTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var controlRevision = 0
     @ObservationIgnored private var helperStatusCheck = 0
@@ -100,10 +112,13 @@ final class AppStore {
     @ObservationIgnored private var startupRestoreAttempts = 0
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
-    @ObservationIgnored private let helper = HelperClient()
+    @ObservationIgnored private let helper: any ControlServiceConnection
 
-    init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil) {
+    init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil,
+         reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient()) {
         self.defaults = defaults
+        self.reader = reader
+        self.helper = helper
         settings = defaults.data(forKey: "settings").flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) } ?? AppSettings()
         lastControl = defaults.data(forKey: "lastControlConfiguration").flatMap {
             try? JSONDecoder().decode(LastControlConfiguration.self, from: $0)
@@ -251,21 +266,26 @@ final class AppStore {
 
     func retry() {
         pollingTask?.cancel(); generation += 1
+        let expectedGeneration = generation
         isLoading = true
         Task {
             await reader.reset()
+            guard generation == expectedGeneration, !isSuspended else { return }
             beginPolling()
         }
     }
 
     func suspend() {
+        guard !isSuspended else { return }
         isSuspended = true
         helperSessionKnown = false
         startupRestorePending = false
         pollingTask?.cancel(); generation += 1
         if hasCustomControl || controlPending || recoveryUnconfirmed {
             recoveryUnconfirmed = true
-            Task { do { try await restoreHardware() } catch { record(error.localizedDescription, error: true) } }
+            if sleepRestoreTask == nil {
+                sleepRestoreTask = Task { do { try await restoreHardware() } catch { record(error.localizedDescription, error: true) } }
+            }
         } else {
             policies = []; activePresetID = nil; activeBuiltIn = "automatic"
         }
@@ -273,13 +293,27 @@ final class AppStore {
     }
 
     func resume() {
+        guard isSuspended else { return }
         isSuspended = false
         snapshot = nil
-        record(text("系统已唤醒，自定义策略未自动恢复。", "System awake. Custom policies were not resumed."))
-        retry()
+        startupRestorePending = true
+        startupRestoreAttempts = 0
+        record(text("系统已唤醒，等待最新读数后恢复上次策略。", "System awake. Waiting for fresh readings to resume the last policy."))
+        let expectedGeneration = generation
+        Task {
+            // 快速唤醒时，睡眠前的恢复请求可能仍在进行；先完成交接，避免随后清除新策略。
+            await sleepRestoreTask?.value
+            guard generation == expectedGeneration, !isSuspended else { return }
+            sleepRestoreTask = nil
+            retry()
+        }
     }
 
-    func stop() { pollingTask?.cancel(); clockTask?.cancel(); helper.disconnect() }
+    func stop() {
+        pollingTask?.cancel(); clockTask?.cancel(); generation += 1
+        startupRestorePending = false
+        helper.disconnect()
+    }
 
     func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom") async throws {
         guard canControl, let snapshot else { throw ControlError.readOnly }

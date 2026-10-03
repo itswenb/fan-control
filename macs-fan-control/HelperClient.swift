@@ -1,7 +1,22 @@
 import Foundation
+#if SWIFT_PACKAGE
+import FanCore
+#endif
 
 @MainActor
-final class HelperClient {
+protocol ControlServiceConnection: AnyObject {
+    var bundled: Bool { get }
+    var signed: Bool { get }
+    var installed: Bool { get }
+    var onDisconnect: (() -> Void)? { get set }
+    func request(_ request: HelperRequest) async throws -> HelperReply
+    func register() async throws
+    func unregister(connectionFailed: Bool) async throws
+    func disconnect()
+}
+
+@MainActor
+final class HelperClient: ControlServiceConnection {
     private var connection: NSXPCConnection?
     private var connectionID: UUID?
     private var pending: [UUID: CheckedContinuation<HelperReply, any Error>] = [:]

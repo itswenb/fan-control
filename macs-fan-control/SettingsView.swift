@@ -73,7 +73,7 @@ struct SettingsView: View {
             }
             Section {
                 LabeledContent(store.text("版本", "Version"), value: "0.2.0")
-                Text(store.text("关闭窗口后继续在菜单栏运行。重新启动或唤醒后，不会自动恢复自定义控制。", "Closing the window keeps the app in the menu bar. Custom control does not resume after launch or wake."))
+                Text(store.text("关闭窗口后继续在菜单栏运行。重新启动或唤醒后，硬件数据通过校验时恢复上次策略。", "Closing the window keeps the app in the menu bar. The last policy resumes after launch or wake when hardware readings pass validation."))
                     .font(.caption).foregroundStyle(.secondary)
                 Button(store.text("恢复显示默认值", "Reset display preferences")) {
                     let language = store.settings.language

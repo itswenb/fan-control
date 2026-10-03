@@ -1,6 +1,15 @@
 {
-  "originHash" : "c09696a2d0f30093e3e3f6c63d1c274c346a361e0c66c2a7db8253640104c3d9",
+  "originHash" : "0ceffba59ab77aa267db9cecde141b515587e2c8bbdc68d4c9af36606b98ebe6",
   "pins" : [
+    {
+      "identity" : "devicehardware",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Shakshi3104/DeviceHardware.git",
+      "state" : {
+        "revision" : "1a12f5098d387b85e8f9e80a97af242b867b2269",
+        "version" : "3.7.1"
+      }
+    },
     {
       "identity" : "siliconscope",
       "kind" : "remoteSourceControl",
