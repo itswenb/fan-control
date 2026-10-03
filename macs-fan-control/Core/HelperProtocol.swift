@@ -4,7 +4,7 @@ public enum HelperConstants {
     public static let machService = "com.itswenb.fancontrol.helper"
     public static let appIdentifier = "com.itswenb.fancontrol"
     public static let plistName = machService + ".plist"
-    public static let protocolVersion = 2
+    public static let protocolVersion = 3
     public static let installedHelperPath = "/Library/PrivilegedHelperTools/" + machService
     public static let daemonPath = "/Library/LaunchDaemons/" + plistName
     public static let supportPath = "/Library/Application Support/FanControl-helper"
@@ -21,7 +21,10 @@ public struct HelperRequest: Codable, Sendable {
     public var version = HelperConstants.protocolVersion
     public var operation: Operation
     public var policies: [FanPolicy]
-    public init(operation: Operation, policies: [FanPolicy] = []) { self.operation = operation; self.policies = policies }
+    public var temperatureSources: [ControlTemperatureSource]
+    public init(operation: Operation, policies: [FanPolicy] = [], temperatureSources: [ControlTemperatureSource] = []) {
+        self.operation = operation; self.policies = policies; self.temperatureSources = temperatureSources
+    }
 }
 
 public struct HelperReply: Codable, Sendable {

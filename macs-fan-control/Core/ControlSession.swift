@@ -2,7 +2,7 @@ import Foundation
 
 /// 由独立服务在单一执行器中调用。所有写入、确认和租约回收均发生在服务端。
 public protocol FanControlDriver: AnyObject {
-    func snapshot() throws -> HardwareSnapshot
+    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot
     func setTarget(fanID: String, rpm: Double) throws
     func restoreAutomatic(fanID: String) throws
 }
@@ -55,6 +55,7 @@ public final class ControlSession {
     private let journal: any ControlJournal
     private var owner: UUID?
     private var policies: [FanPolicy] = []
+    private var temperatureSources: [ControlTemperatureSource] = []
     private var pending = Set<String>()
     private var touched = Set<String>()
     private var ramps: [String: RampState] = [:]
@@ -83,11 +84,13 @@ public final class ControlSession {
         lastHeartbeat = uptime
     }
 
-    public func apply(_ requested: [FanPolicy], client: UUID, uptime: TimeInterval, now: Date) throws {
+    public func apply(_ requested: [FanPolicy], temperatureSources: [ControlTemperatureSource] = [],
+                      client: UUID, uptime: TimeInterval, now: Date) throws {
         guard removalOwner == nil else { throw SessionError.busy }
         guard owner == nil || owner == client else { throw SessionError.busy }
         guard pending.isEmpty, !journalFailure else { throw SessionError.recoveryRequired }
-        let snapshot = try driver.snapshot()
+        try ControlTemperatureSource.validate(temperatureSources, for: requested)
+        let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
         try PolicyValidator.validate(requested, in: snapshot, at: max(now, snapshot.timestamp))
         do { try verifyOwnership(in: snapshot) }
         catch { recover(reason: error.localizedDescription); throw error }
@@ -101,6 +104,7 @@ public final class ControlSession {
         touched = recoverySet
         owner = client
         policies = requested
+        self.temperatureSources = temperatureSources
         ramps = [:]
         confirmedTargets = [:]
         lastHeartbeat = uptime
@@ -112,7 +116,7 @@ public final class ControlSession {
             touched = toControl
             try update(snapshot: snapshot, now: now)
             try journal.save(touched)
-            if touched.isEmpty { owner = nil; policies = [] }
+            if touched.isEmpty { owner = nil; policies = []; self.temperatureSources = [] }
         } catch {
             // 包含本次所有可能触达的风扇，不能只回滚最后一次成功写入。
             touched = recoverySet
@@ -143,7 +147,7 @@ public final class ControlSession {
         }
         lastTick = uptime
         do {
-            let snapshot = try driver.snapshot()
+            let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
             try PolicyValidator.validate(policies, in: snapshot, at: max(now, snapshot.timestamp))
             try verifyOwnership(in: snapshot)
             try update(snapshot: snapshot, now: now)
@@ -196,7 +200,7 @@ public final class ControlSession {
     }
 
     private func recover(reason: String, cause: RecoveryReason = .controlFailure) {
-        policies = []; ramps = [:]; confirmedTargets = [:]; message = reason
+        policies = []; temperatureSources = []; ramps = [:]; confirmedTargets = [:]; message = reason
         recoveryReason = cause
         pending.formUnion(touched)
         retriesRemaining = 4

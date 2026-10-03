@@ -18,12 +18,16 @@ private final class FakeDriver: FanControlDriver {
     var failRestore: String?
     var writes: [String] = []
     var restores: [String] = []
+    var requestedSources: [[ControlTemperatureSource]] = []
     init(now: Date) {
         value = HardwareSnapshot(model: "test", chip: "test", source: .live,
                                  fans: ["F0", "F1"].map { FanReading(id: $0, name: $0, rpm: 2_000, minimum: 1_200, maximum: 6_000, mode: .automatic, sampledAt: now, controlSupported: true) },
                                  sensors: [SensorReading(id: "T0", name: "T0", group: .other, celsius: 55, sampledAt: now)], timestamp: now)
     }
-    func snapshot() throws -> HardwareSnapshot { value }
+    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
+        requestedSources.append(temperatureSources)
+        return value
+    }
     func setTarget(fanID: String, rpm: Double) throws {
         writes.append(fanID)
         if failWrite == fanID { throw ControlError.invalidRPM }
@@ -39,6 +43,22 @@ private final class FakeDriver: FanControlDriver {
 }
 
 struct SessionTests {
+    @Test func sensorPolicyKeepsOnlySelectedSourcesAndRejectsUnrelatedSourcesBeforeReading() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        #expect(throws: ControlError.missingSensor) { try session.apply([policy], client: client, uptime: 10, now: now) }
+        #expect(driver.requestedSources.isEmpty && driver.writes.isEmpty)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: now)
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now.addingTimeInterval(1))
+        #expect(driver.requestedSources == [sources, sources])
+        #expect(driver.writes == ["F0"])
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 12, now: now)
+        #expect(driver.requestedSources.last?.isEmpty == true)
+    }
+
     @Test func unsupportedFanIsRejectedBeforeAnyWriteOrJournalChange() throws {
         let now = Date(), driver = FakeDriver(now: Date()), journal = MemoryJournal()
         driver.value.fans[1].controlSupported = false
@@ -170,7 +190,8 @@ struct SessionTests {
         let session = try ControlSession(driver: driver, journal: journal)
         #expect(driver.restores == ["F1"])
         let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
-        try session.apply([policy], client: client, uptime: 10, now: now)
+        try session.apply([policy], temperatureSources: ControlTemperatureSource.resolve([policy], in: driver.value),
+                          client: client, uptime: 10, now: now)
         session.heartbeat(client: client, uptime: 12)
         session.tick(uptime: 12, now: now.addingTimeInterval(4))
         #expect(session.status.owner == nil)

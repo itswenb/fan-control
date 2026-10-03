@@ -27,7 +27,9 @@ final class HelperClient: ControlServiceConnection {
         FileManager.default.fileExists(atPath: Bundle.main.bundleURL.appendingPathComponent("Contents/Library/HelperTools/FanControlHelper").path)
     }
     private var helperURL: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Library/HelperTools/FanControlHelper") }
-    var signed: Bool { (try? CodeIdentity.read(at: helperURL, identifier: HelperConstants.machService)) != nil }
+    // 界面状态只校验一次；连接与管理员安装操作仍独立验证当前代码身份。
+    private lazy var bundledSignatureValid = (try? CodeIdentity.read(at: helperURL, identifier: HelperConstants.machService)) != nil
+    var signed: Bool { bundledSignatureValid }
     var installed: Bool { FileManager.default.fileExists(atPath: HelperConstants.installedHelperPath) }
 
     func register() async throws {

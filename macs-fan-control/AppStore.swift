@@ -102,7 +102,7 @@ final class AppStore {
     @ObservationIgnored private let reader: any HardwareSampling
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var helperPollingTask: Task<Void, Never>?
-    @ObservationIgnored private var clockTask: Task<Void, Never>?
+    @ObservationIgnored private var started = false
     @ObservationIgnored private var controlActivity: NSObjectProtocol?
     @ObservationIgnored private var sleepRestoreTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
@@ -229,13 +229,8 @@ final class AppStore {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--capture-preview") { return }
         #endif
-        guard clockTask == nil else { return }
-        clockTask = Task { [weak self] in
-            while !Task.isCancelled {
-                self?.now = Date()
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
+        guard !started else { return }
+        started = true
         beginPolling()
     }
 
@@ -261,16 +256,17 @@ final class AppStore {
                     self.connectionError = error.localizedDescription
                     self.isLoading = false
                 }
-                try? await Task.sleep(for: .seconds(self.connectionError == nil ? 1 : 5))
+                try? await Task.sleep(for: .seconds(self.connectionError == nil ? 2 : 5))
             }
         }
         // 监控读取可能较慢或失败；控制租约的心跳必须独立于界面采样。
         helperPollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
+                self.now = Date()
                 self.refreshHelperRegistration()
                 if self.helperRegistered && !self.helperInstalling { await self.refreshHelperSession() }
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: .seconds(self.hasCustomControl || self.recoveryUnconfirmed ? 1 : 2))
             }
         }
     }
@@ -316,7 +312,8 @@ final class AppStore {
     }
 
     func stop() {
-        pollingTask?.cancel(); helperPollingTask?.cancel(); clockTask?.cancel(); generation += 1
+        pollingTask?.cancel(); helperPollingTask?.cancel(); generation += 1
+        started = false
         startupRestorePending = false
         helper.disconnect()
         endControlActivity()
@@ -339,13 +336,15 @@ final class AppStore {
     func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom") async throws {
         guard canControl, let snapshot else { throw ControlError.readOnly }
         try PolicyValidator.validate(newPolicies, in: snapshot, at: Date())
+        let temperatureSources = try ControlTemperatureSource.resolve(newPolicies, in: snapshot)
         startupRestorePending = false
         controlPending = true
         controlRevision += 1
         defer { controlPending = false }
         let expected = newPolicies.contains(where: { $0.mode != .automatic }) ? newPolicies : []
         do {
-            let reply = try await helper.request(HelperRequest(operation: .apply, policies: newPolicies))
+            let reply = try await helper.request(HelperRequest(operation: .apply, policies: newPolicies,
+                                                             temperatureSources: temperatureSources))
             guard reply.status?.recoveryBlocked == false, reply.status?.policies == expected else { throw SessionError.recoveryRequired }
         } catch {
             helper.disconnect()

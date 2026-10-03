@@ -37,7 +37,7 @@ private actor HelperWorker {
         let uptime = ProcessInfo.processInfo.systemUptime
         guard session == nil, force || uptime >= nextInitializationAttempt else { return }
         do {
-            let snapshot = try device.snapshot()
+            let snapshot = try device.controlSnapshot(temperatureSources: [])
             session = try ControlSession(driver: device, journal: RecoveryJournal(model: snapshot.model))
             initializationError = nil
             retryDelay = 1
@@ -74,7 +74,8 @@ private actor HelperWorker {
                     guard device.controlAvailable else { throw ControlError.readOnly }
                     let state = ProcessInfo.processInfo.thermalState
                     guard state != .serious, state != .critical else { throw ControlError.readOnly }
-                    try session.apply(request.policies, client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+                    try session.apply(request.policies, temperatureSources: request.temperatureSources,
+                                      client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
                 }
             }
         } catch { response.error = error.localizedDescription }

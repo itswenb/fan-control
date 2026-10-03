@@ -21,7 +21,7 @@ private final class MemoryDriver: FanControlDriver {
                                  sensors: [SensorReading(id: "T0", name: "CPU", group: .cpu, celsius: 55, sampledAt: now)], timestamp: now)
     }
 
-    func snapshot() throws -> HardwareSnapshot { value }
+    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot { value }
     func setTarget(fanID: String, rpm: Double) throws { value.fans[0].mode = .fixed; value.fans[0].target = rpm }
     func restoreAutomatic(fanID: String) throws { restores += 1; value.fans[0].mode = .automatic }
 }
@@ -69,7 +69,8 @@ private final class MemoryService: ControlServiceConnection {
         switch request.operation {
         case .apply:
             if failApply { throw ControlError.invalidRPM }
-            try session.apply(request.policies, client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+            try session.apply(request.policies, temperatureSources: request.temperatureSources,
+                              client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
         case .restore:
             if holdRestore { await withCheckedContinuation { restoreContinuation = $0 } }
             try session.release(client: client)
@@ -118,6 +119,17 @@ struct LifecycleTests {
         let deadline = Date().addingTimeInterval(5)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
+    }
+
+    @Test func healthySessionDoesNotReapplyPolicyWhenMonitoringRefreshes() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 3 }
+        #expect(f.service.applyCount == 1)
+        #expect(f.service.requests.filter { $0 == .heartbeat }.count >= 3)
+        #expect(f.store.policies == [f.policy])
     }
 
     @Test func blockedTemperatureReadDoesNotBlockControlHeartbeat() async throws {
