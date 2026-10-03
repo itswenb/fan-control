@@ -4,6 +4,7 @@ import ServiceManagement
 
 struct SettingsView: View {
     @Environment(AppStore.self) private var store
+    @EnvironmentObject private var updater: AppUpdater
     @State private var showControlSetup = false
     var body: some View {
         @Bindable var store = store
@@ -72,7 +73,12 @@ struct SettingsView: View {
                 }
             }
             Section {
-                LabeledContent(store.text("版本", "Version"), value: "0.2.0")
+                LabeledContent(store.text("版本", "Version"), value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
+                Toggle(store.text("自动检查更新", "Automatically check for updates"), isOn: Binding(
+                    get: { updater.automaticallyChecksForUpdates }, set: { updater.automaticallyChecksForUpdates = $0 }
+                ))
+                Button(store.text("检查更新…", "Check for Updates…")) { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
                 Text(store.text("关闭窗口后继续在菜单栏运行。重新启动或唤醒后，硬件数据通过校验时恢复上次策略。", "Closing the window keeps the app in the menu bar. The last policy resumes after launch or wake when hardware readings pass validation."))
                     .font(.caption).foregroundStyle(.secondary)
                 Button(store.text("恢复显示默认值", "Reset display preferences")) {
@@ -95,6 +101,7 @@ struct SettingsView: View {
 
 struct MenuBarView: View {
     @Environment(AppStore.self) private var store
+    @EnvironmentObject private var updater: AppUpdater
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     var body: some View {
@@ -112,10 +119,18 @@ struct MenuBarView: View {
                 }
             }
             ForEach(store.snapshot?.fans ?? []) { fan in
+                let current = store.formattedRPM(fan.rpm, fresh: fan.isFresh(at: store.now))
+                let maximum = store.formattedRPM(fan.maximum)
                 HStack {
                     Text(store.fanName(fan)).foregroundStyle(.secondary)
                     Spacer()
-                    Text(store.formattedRPM(fan.rpm, fresh: fan.isFresh(at: store.now)) + " RPM").monospacedDigit()
+                    HStack(alignment: .firstTextBaseline, spacing: 1) {
+                        Text(current).font(.body.weight(.medium)).foregroundStyle(.primary)
+                        Text("/" + maximum + " RPM").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .monospacedDigit().fixedSize()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(store.text("当前转速 \(current) RPM，最大转速 \(maximum) RPM", "Current speed \(current) RPM, maximum speed \(maximum) RPM"))
                 }
             }
             if store.snapshot == nil { Text(store.text("暂无硬件读数", "No hardware readings")).foregroundStyle(.secondary) }
@@ -154,6 +169,8 @@ struct MenuBarView: View {
             }.disabled(store.controlPending)
             Button(store.text("全部恢复系统自动", "Restore all to automatic")) { store.restoreAutomatic() }
                 .disabled((!store.hasCustomControl && !store.recoveryUnconfirmed) || store.controlPending)
+            Button(store.text("检查更新…", "Check for Updates…")) { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
             Divider()
             HStack {
                 Button(store.text("打开主窗口", "Open window")) { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }

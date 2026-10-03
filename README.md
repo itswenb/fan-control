@@ -11,6 +11,7 @@ Fan Control 是使用 SwiftUI 构建的原生 macOS 风扇控制工具，功能�
 - CPU、GPU、内存和电池平均温度置顶，具体测点按上游库提供的名称显示；缺少有效测点时不生成对应平均值。
 - 支持温度排序、名称或原始键搜索，以及未识别测点筛选。
 - 支持摄氏／华氏温标、显示精度、简体中文／英文界面和登录启动。
+- 通过 Sparkle 自动检查 GitHub Releases 更新，提供更新说明、下载、签名验证与安装入口。
 - 使用原生 macOS 材质；macOS 26 及更新系统提供 Liquid Glass 效果。
 - 独立控制服务通过 XPC 通信，具备签名校验、控制权隔离、心跳超时恢复、写入前恢复日志和读回确认。
 
@@ -31,6 +32,8 @@ Fan Control 是使用 SwiftUI 构建的原生 macOS 风扇控制工具，功能�
 ## 安装与使用
 
 打开 DMG，将 `Fan Control.app` 拖到其中的 `Applications` 快捷入口，再从“应用程序”打开。替换已有应用前先退出正在运行的版本。
+
+目前发布包使用 ad hoc 签名，没有 Apple Developer ID 或 Apple 公证。首次打开时，如果 macOS 阻止运行，请在“系统设置 → 隐私与安全性”中确认来源后选择“仍要打开”。应用应安装到可写的位置；不要直接从只读 DMG 中执行更新。
 
 打开应用即可监控。首次调速时，点击“启用风扇控制…”→“安装并启用…”，由 macOS 请求管理员授权。随后选择策略并应用。关闭主窗口后，应用继续在菜单栏运行。
 
@@ -66,6 +69,35 @@ FANCONTROL_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" bash scr
 
 Xcode 工程为 `macs-fan-control.xcodeproj`，共享 scheme 为 `macs-fan-control`。Swift Package 管理控制服务、硬件层和核心测试的依赖。
 
+## 自动更新与发布
+
+无需购买 Apple 开发者账号。应用使用本地 ad hoc 代码签名；Sparkle 使用独立的 Ed25519 密钥验证更新包和更新清单，公钥嵌入应用，私钥不随源码或安装包分发。这种签名不能代替 Apple 公证。通过菜单或设置中的“检查更新…”手动检查，也可在设置中启用或关闭定期检查。安装更新需要重启应用；控制服务的信任升级仍可能请求管理员授权，完成后按最后保存的策略恢复控制。
+
+更新源为本仓库 GitHub Releases 的 `appcast.xml`，安装包和清单同时发布到相应版本。`.github/workflows/ci.yml` 在 main 分支和 Pull Request 上运行测试并构建 arm64 DMG；`.github/workflows/release.yml` 在推送 `vmajor.minor.patch` 标签时运行测试、构建签名更新并创建 Release。工作流使用 GitHub 托管的 `macos-26`，不会访问真实风扇。
+
+维护者在仓库的 **Settings → Secrets and variables → Actions** 中添加 `SPARKLE_PRIVATE_KEY`，内容为本机 `.secrets/sparkle.key` 的 Base64 文本。可使用 GitHub CLI 直接读取文件配置，避免将密钥打印到终端：
+
+```sh
+gh secret set SPARKLE_PRIVATE_KEY --repo itswenb/fan-control < .secrets/sparkle.key
+```
+
+私钥应单独安全备份；`.secrets/` 已被 Git 忽略。每次发布必须使用与 `Configuration/Updates.xcconfig` 公钥匹配的同一私钥。没有 Developer ID 时，不应随意更换公钥，否则已安装版本将无法验证新更新。Fork 项目应使用自己的密钥和更新源，并同步修改发布脚本中的仓库地址；新项目可运行 `swift scripts/update-key.swift generate` 生成自己的密钥，工具拒绝覆盖现有私钥。
+
+本地生成已签名的发布产物：
+
+```sh
+FANCONTROL_VERSION=0.3.0 bash scripts/build-release.sh
+```
+
+产物位于 `build/releases/`，包含 `FanControl-0.3.0.dmg` 和带签名的 `appcast.xml`。脚本检查版本、公私钥匹配、签名、篡改拒绝和下载地址。准备好 Actions Secret 后，推送对应版本标签即可触发发布：
+
+```sh
+git tag v0.3.0
+git push origin main v0.3.0
+```
+
+首次发布更新功能后，使用旧版且尚未包含 Sparkle 的用户需要手动安装一次，之后可在应用内更新。
+
 ## 测试与贡献
 
 使用与应用构建相同的 Xcode 工具链运行核心测试：
@@ -82,6 +114,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-pa
 
 温度、风扇读数和调速策略在本机处理。用户设置和预设保存在本机，控制服务的信任记录与恢复日志由 root 管理。源码中没有集成分析上报。
 
+检查更新时会通过 HTTPS 访问 GitHub 获取更新清单和安装包，不上传温度、风扇策略或本机诊断报告；Sparkle 的可选系统配置上报已关闭。
+
 ## 许可证与第三方声明
 
 本项目采用 [MIT License](LICENSE)。第三方依赖及协议参考的版权声明如下；分发应用或修改源码时，请一并保留相应声明。
@@ -92,6 +126,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --scratch-pa
 | [SiliconScopeCore 4.4.0](https://github.com/kennss/SiliconScope) | 温度采样、分类与传感器名称 | MIT |
 | [Stats](https://github.com/exelban/stats) | SiliconScope 上游传感器映射资料 | MIT |
 | [beltex/SMCKit](https://github.com/beltex/SMCKit) | SMC 消息布局与键枚举协议参考 | MIT |
+| [Sparkle 2.10.0](https://github.com/sparkle-project/Sparkle) | 应用内自动更新与发布签名工具 | MIT 及附带第三方许可 |
+
+Sparkle 的完整版权和附带许可保存在 [LICENSES/Sparkle.txt](LICENSES/Sparkle.txt)，并随应用分发。说明文档仅保留本 README；LICENSE 与第三方许可属于法律文件。
 
 Stats © Serhiy Mytrovtsiy。本项目通过 SiliconScopeCore 使用上游温度映射；SMC 消息编码、数值解码和风扇控制服务由本项目实现。
 

@@ -11,12 +11,16 @@
 		D3C1CE000000000000000005 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = D3C1CE000000000000000004 /* README.md */; };
 		D3C1CE000000000000000006 /* SiliconScopeCore in Frameworks */ = {isa = PBXBuildFile; productRef = D3C1CE000000000000000008 /* SiliconScopeCore */; };
 		D3C1CE000000000000000009 /* LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = D3C1CE00000000000000000A /* LICENSE */; };
+		D3C1CE00000000000000000B /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D3C1CE00000000000000000D /* Sparkle */; };
+		D3C1CE000000000000000010 /* Sparkle.txt in Resources */ = {isa = PBXBuildFile; fileRef = D3C1CE00000000000000000F /* Sparkle.txt */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Fan Control.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Fan Control.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		D3C1CE000000000000000004 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		D3C1CE00000000000000000A /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
+		D3C1CE00000000000000000E /* Updates.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Configuration/Updates.xcconfig; sourceTree = "<group>"; };
+		D3C1CE00000000000000000F /* Sparkle.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSES/Sparkle.txt; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -33,6 +37,7 @@
 			files = (
 				D3C1CE000000000000000001 /* DeviceHardware in Frameworks */,
 				D3C1CE000000000000000006 /* SiliconScopeCore in Frameworks */,
+				D3C1CE00000000000000000B /* Sparkle in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -44,6 +49,8 @@
 				000000000000000000000010 /* macs-fan-control */,
 				D3C1CE000000000000000004 /* README.md */,
 				D3C1CE00000000000000000A /* LICENSE */,
+				D3C1CE00000000000000000E /* Updates.xcconfig */,
+				D3C1CE00000000000000000F /* Sparkle.txt */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -77,6 +84,7 @@
 			packageProductDependencies = (
 				D3C1CE000000000000000003 /* DeviceHardware */,
 				D3C1CE000000000000000008 /* SiliconScopeCore */,
+				D3C1CE00000000000000000D /* Sparkle */,
 			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* Fan Control.app */;
@@ -109,6 +117,7 @@
 			packageReferences = (
 				D3C1CE000000000000000002 /* XCRemoteSwiftPackageReference "DeviceHardware" */,
 				D3C1CE000000000000000007 /* XCRemoteSwiftPackageReference "SiliconScope" */,
+				D3C1CE00000000000000000C /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
@@ -126,6 +135,7 @@
 			files = (
 				D3C1CE000000000000000005 /* README.md in Resources */,
 				D3C1CE000000000000000009 /* LICENSE in Resources */,
+				D3C1CE000000000000000010 /* Sparkle.txt in Resources */,
 			);
 		};
 /* End PBXResourcesBuildPhase section */
@@ -307,12 +317,13 @@
 		};
 		000000000000000111000000 /* Debug configuration for PBXNativeTarget "macs-fan-control" */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = D3C1CE00000000000000000E /* Updates.xcconfig */;
 			buildSettings = {
 				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 0.3.0;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_DEBUG_DYLIB = NO;
@@ -320,6 +331,7 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Configuration/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Fan Control";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -334,7 +346,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-undefined",
@@ -357,18 +369,20 @@
 		};
 		000000000000000112000000 /* Release configuration for PBXNativeTarget "macs-fan-control" */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = D3C1CE00000000000000000E /* Updates.xcconfig */;
 			buildSettings = {
 				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 0.3.0;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Configuration/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Fan Control";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -383,7 +397,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-undefined",
@@ -426,6 +440,11 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		D3C1CE00000000000000000C /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = { kind = exactVersion; version = 2.10.0; };
+		};
 		D3C1CE000000000000000002 /* XCRemoteSwiftPackageReference "DeviceHardware" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/Shakshi3104/DeviceHardware.git";
@@ -445,6 +464,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		D3C1CE00000000000000000D /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D3C1CE00000000000000000C /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
 		D3C1CE000000000000000003 /* DeviceHardware */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = D3C1CE000000000000000002 /* XCRemoteSwiftPackageReference "DeviceHardware" */;

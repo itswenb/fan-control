@@ -17,7 +17,7 @@ let package = Package(
         .target(name: "FanHardware", dependencies: ["FanCore", .product(name: "SiliconScopeCore", package: "SiliconScope")], path: "macs-fan-control/Hardware"),
         .target(name: "FanAppModel", dependencies: ["FanCore", "FanHardware", .product(name: "DeviceHardware", package: "DeviceHardware")],
                 path: "macs-fan-control",
-                exclude: ["Core", "Hardware", "Assets.xcassets", "MyApp.swift", "ContentView.swift", "FanEditorView.swift", "PresetsView.swift", "SettingsView.swift", "GlassStyle.swift", "DebugPreview.swift"],
+                exclude: ["Core", "Hardware", "Assets.xcassets", "MyApp.swift", "ContentView.swift", "FanEditorView.swift", "PresetsView.swift", "SettingsView.swift", "GlassStyle.swift", "DebugPreview.swift", "AppUpdater.swift"],
                 sources: ["AppStore.swift", "HelperClient.swift"]),
         .executableTarget(name: "FanProbe", dependencies: ["FanCore", "FanHardware"], path: "Tools/FanProbe", linkerSettings: [.unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])]),
         .executableTarget(name: "FanControlHelper", dependencies: ["FanCore", "FanHardware"], path: "Helper", linkerSettings: [.unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])]),

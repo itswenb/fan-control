@@ -5,6 +5,7 @@ import SwiftUI
 struct MyApp: App {
     @NSApplicationDelegateAdaptor(AppLifecycle.self) private var lifecycle
     @State private var store: AppStore
+    @StateObject private var updater = AppUpdater()
 
     init() {
         let store = AppStore()
@@ -14,23 +15,27 @@ struct MyApp: App {
 
     var body: some Scene {
         Window("Fan Control", id: "main") {
-            ContentView().environment(store).tint(.accentColor)
+            ContentView().environment(store).environmentObject(updater).tint(.accentColor)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 900, height: 560)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                Button(store.text("检查更新…", "Check for Updates…")) { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
+            }
             CommandGroup(after: .saveItem) {
                 Button(store.text("保存当前预设…", "Save current preset…")) { store.showSavePreset = true }
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(store.snapshot?.fans.isEmpty != false || store.configurationError != nil)
             }
         }
-        MenuBarExtra { MenuBarView().environment(store) } label: {
+        MenuBarExtra { MenuBarView().environment(store).environmentObject(updater) } label: {
             MenuBarStatusLabel().environment(store)
         }.menuBarExtraStyle(.window)
-        Settings { SettingsView().environment(store) }
+        Settings { SettingsView().environment(store).environmentObject(updater) }
     }
 }
 

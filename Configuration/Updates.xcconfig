@@ -1,0 +1,5 @@
+// 公钥可公开；对应的私钥只能保存在本机或 GitHub Actions Secrets。
+INFOPLIST_KEY_SUPublicEDKey = jCJO8ijDHh8Rt8nqLtQb2r9AcI3H/RdQTZWdvPpJqjQ=
+INFOPLIST_KEY_SUFeedURL = https:/$()/github.com/itswenb/fan-control/releases/latest/download/appcast.xml
+// 无 Developer ID 的构建采用 ad hoc 签名，避免第三方框架的 Team ID 验证失败。
+ENABLE_HARDENED_RUNTIME = NO

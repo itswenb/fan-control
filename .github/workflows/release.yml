@@ -1,0 +1,45 @@
+name: 发布签名更新
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fan-control-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: 校验版本标签
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo '版本标签必须使用 vmajor.minor.patch 格式。' >&2
+            exit 1
+          fi
+          echo "FANCONTROL_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - name: 运行模拟硬件和应用生命周期测试
+        run: swift test --scratch-path .build
+      - name: 构建安装包并签名更新清单
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: bash scripts/build-release.sh
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "build/releases/FanControl-$FANCONTROL_VERSION.dmg" \
+            build/releases/appcast.xml \
+            --title "Fan Control $FANCONTROL_VERSION" --generate-notes --verify-tag

@@ -642,7 +642,7 @@ final class AppStore {
         let readings = snapshot?.sensors.map { "\($0.id): \($0.celsius.map(String.init(describing:)) ?? "unavailable") °C" }.joined(separator: "\n") ?? "unavailable"
         let log = events.map { "\($0.date.ISO8601Format()) \($0.isError ? "ERROR" : "INFO") \($0.message)" }.joined(separator: "\n")
         return """
-        Fan Control · 0.2.0
+        Fan Control · \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown")
         OS: \(ProcessInfo.processInfo.operatingSystemVersionString)
         Model: \(snapshot?.model ?? "unknown")
         Source: AppleSMC

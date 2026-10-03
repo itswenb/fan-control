@@ -25,6 +25,7 @@ xcuserdata/
 *.xcscmblueprint
 
 # 本机凭据与签名材料
+.secrets/
 .env
 .env.*
 *.p12

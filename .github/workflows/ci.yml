@@ -1,0 +1,26 @@
+name: 持续集成
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: 运行模拟硬件和应用生命周期测试
+        run: swift test --scratch-path .build
+      - name: 构建和验证 Apple Silicon 应用
+        run: bash scripts/build-dmg.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FanControl-arm64
+          path: build/FanControl.dmg
+          if-no-files-found: error
