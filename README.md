@@ -41,6 +41,8 @@ Fan Control 是使用 SwiftUI 构建的原生 macOS 风扇控制工具，功能�
 
 应用会记住最后一次成功应用的策略，更新、重新启动应用或睡眠唤醒后，在服务连接且最新硬件数据通过校验时自动恢复，并同步预设名称。睡眠期间风扇交由系统控制，唤醒后等待睡眠前的恢复请求完成，再重新采样和应用策略；恢复失败时保留系统控制并显示原因，不循环重新应用。主动选择“系统自动”后，下一次启动或唤醒也保持自动。旧版本未保存上次策略的记录，需要先应用一次。设置中的“恢复自动并停用服务”会移除服务并清除自动恢复记录。使用其他风扇工具时，请先在原工具中恢复系统自动并退出，避免同时控制同一风扇。
 
+心跳独立于界面温度采样发送，执行自定义策略时避免 App Nap 延后控制通信，仍允许熄屏与正常睡眠。心跳超时、服务采样中断或连接中断后，先确认风扇已恢复系统控制，再校验最新读数并尝试恢复原策略；恢复失败不重复写入。过热、无效读数、写入故障或其他工具接管导致的退出不会自动重新接管。控制服务会记录具体中断原因及间隔，目标转速未变化时仍核对所有权和读数，但不重复写入 SMC。
+
 ## 从源码构建
 
 工程使用 Swift 6，建议安装 Xcode 26 或更新版本。在项目根目录执行：
@@ -86,14 +88,14 @@ gh secret set SPARKLE_PRIVATE_KEY --repo itswenb/fan-control < .secrets/sparkle.
 本地生成已签名的发布产物：
 
 ```sh
-FANCONTROL_VERSION=0.3.0 bash scripts/build-release.sh
+FANCONTROL_VERSION=0.3.1 bash scripts/build-release.sh
 ```
 
-产物位于 `build/releases/`，包含 `FanControl-0.3.0.dmg` 和带签名的 `appcast.xml`。脚本检查版本、公私钥匹配、签名、篡改拒绝和下载地址。准备好 Actions Secret 后，推送对应版本标签即可触发发布：
+产物位于 `build/releases/`，包含 `FanControl-0.3.1.dmg` 和带签名的 `appcast.xml`。脚本检查版本、公私钥匹配、签名、篡改拒绝和下载地址。准备好 Actions Secret 后，推送对应版本标签即可触发发布：
 
 ```sh
-git tag v0.3.0
-git push origin main v0.3.0
+git tag v0.3.1
+git push origin main v0.3.1
 ```
 
 首次发布更新功能后，使用旧版且尚未包含 Sparkle 的用户需要手动安装一次，之后可在应用内更新。

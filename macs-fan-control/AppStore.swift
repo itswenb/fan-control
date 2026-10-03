@@ -67,11 +67,11 @@ final class AppStore {
     var snapshot: HardwareSnapshot?
     var now = Date()
     var isLoading = true
-    var isSuspended = false
+    var isSuspended = false { didSet { updateControlActivity() } }
     var connectionError: String?
     var alertMessage: String?
     var presets: [FanPreset] = []
-    var policies: [FanPolicy] = []
+    var policies: [FanPolicy] = [] { didSet { updateControlActivity() } }
     private(set) var displayPolicies: [FanPolicy] = []
     private var helperSessionKnown = false
     var activePresetID: UUID?
@@ -101,7 +101,9 @@ final class AppStore {
 
     @ObservationIgnored private let reader: any HardwareSampling
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
+    @ObservationIgnored private var helperPollingTask: Task<Void, Never>?
     @ObservationIgnored private var clockTask: Task<Void, Never>?
+    @ObservationIgnored private var controlActivity: NSObjectProtocol?
     @ObservationIgnored private var sleepRestoreTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var controlRevision = 0
@@ -237,11 +239,13 @@ final class AppStore {
         beginPolling()
     }
 
-    private func beginPolling() {
+    private func beginPolling(resetReader: Bool = false) {
         pollingTask?.cancel()
+        helperPollingTask?.cancel()
         generation += 1
         let expectedGeneration = generation
         pollingTask = Task { [weak self] in
+            if resetReader { await self?.reader.reset() }
             while !Task.isCancelled {
                 guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
                 do {
@@ -257,22 +261,24 @@ final class AppStore {
                     self.connectionError = error.localizedDescription
                     self.isLoading = false
                 }
+                try? await Task.sleep(for: .seconds(self.connectionError == nil ? 1 : 5))
+            }
+        }
+        // 监控读取可能较慢或失败；控制租约的心跳必须独立于界面采样。
+        helperPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
                 self.refreshHelperRegistration()
                 if self.helperRegistered && !self.helperInstalling { await self.refreshHelperSession() }
-                try? await Task.sleep(for: .seconds(self.connectionError == nil ? 1 : 5))
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
 
     func retry() {
-        pollingTask?.cancel(); generation += 1
-        let expectedGeneration = generation
         isLoading = true
-        Task {
-            await reader.reset()
-            guard generation == expectedGeneration, !isSuspended else { return }
-            beginPolling()
-        }
+        guard !isSuspended else { return }
+        beginPolling(resetReader: true)
     }
 
     func suspend() {
@@ -280,7 +286,7 @@ final class AppStore {
         isSuspended = true
         helperSessionKnown = false
         startupRestorePending = false
-        pollingTask?.cancel(); generation += 1
+        pollingTask?.cancel(); helperPollingTask?.cancel(); generation += 1
         if hasCustomControl || controlPending || recoveryUnconfirmed {
             recoveryUnconfirmed = true
             if sleepRestoreTask == nil {
@@ -310,9 +316,24 @@ final class AppStore {
     }
 
     func stop() {
-        pollingTask?.cancel(); clockTask?.cancel(); generation += 1
+        pollingTask?.cancel(); helperPollingTask?.cancel(); clockTask?.cancel(); generation += 1
         startupRestorePending = false
         helper.disconnect()
+        endControlActivity()
+    }
+
+    private func updateControlActivity() {
+        guard hasCustomControl, !isSuspended else { endControlActivity(); return }
+        if controlActivity == nil {
+            // 维持用户主动选择的持续控制；仍允许熄屏、合盖和系统正常睡眠。
+            controlActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                                   reason: "维持用户选择的风扇策略及控制服务心跳")
+        }
+    }
+
+    private func endControlActivity() {
+        if let controlActivity { ProcessInfo.processInfo.endActivity(controlActivity) }
+        controlActivity = nil
     }
 
     func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom") async throws {
@@ -495,6 +516,11 @@ final class AppStore {
             displayPolicies = status.policies
             if !recoveryUnconfirmed {
                 let wasControlling = hasCustomControl
+                if wasControlling, !reply.ownsSession, status.owner == nil,
+                   status.recoveryReason?.permitsAutomaticResume == true {
+                    startupRestorePending = true
+                    startupRestoreAttempts = 0
+                }
                 policies = reply.ownsSession ? status.policies : []
                 syncActivePreset()
                 if wasControlling && !reply.ownsSession, let message = status.message { record(message) }

@@ -107,6 +107,45 @@ struct SessionTests {
         session.tick(uptime: 16, now: now.addingTimeInterval(6))
         #expect(session.status.owner == nil)
         #expect(driver.restores == ["F0"])
+        #expect(session.status.recoveryReason == .heartbeatExpired)
+    }
+
+    @Test func samplingTimeoutHasItsOwnRecoveryReason() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 10, now: now)
+        session.heartbeat(client: client, uptime: 13.5)
+        session.tick(uptime: 13.5, now: now.addingTimeInterval(3.5))
+        #expect(session.status.recoveryReason == .samplingInterrupted)
+        #expect(session.status.message?.contains("3.5 秒") == true)
+        #expect(session.status.owner == nil)
+    }
+
+    @Test func unchangedTargetsStillDetectExternalChangesWithoutRepeatedWrites() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 10, now: now)
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now.addingTimeInterval(1))
+        #expect(driver.writes == ["F0"])
+        driver.value.fans[0].target = 4_000
+        session.heartbeat(client: client, uptime: 12)
+        session.tick(uptime: 12, now: now.addingTimeInterval(2))
+        #expect(driver.writes == ["F0"])
+        #expect(driver.restores == ["F0"])
+        #expect(session.status.recoveryReason == .controlFailure)
+    }
+
+    @Test func sameTargetIsWrittenAgainAfterExplicitAutomatic() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        let fixed = FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)
+        try session.apply([fixed], client: client, uptime: 10, now: now)
+        try session.apply([FanPolicy(fanID: "F0", mode: .automatic)], client: client, uptime: 11, now: now.addingTimeInterval(1))
+        try session.apply([fixed], client: client, uptime: 12, now: now.addingTimeInterval(2))
+        #expect(driver.writes == ["F0", "F0"])
+        #expect(driver.value.fans[0].mode == .fixed)
+        #expect(driver.value.fans[0].target == 3_000)
     }
 
     @Test func recoveryFailureBlocksNewControlAndRetainsJournal() throws {

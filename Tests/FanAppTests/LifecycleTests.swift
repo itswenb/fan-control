@@ -31,11 +31,14 @@ private final class MemoryReader: HardwareSampling {
     let driver: MemoryDriver
     var samples = 0
     var stale = false
+    var holdSample = false
+    var sampleContinuation: CheckedContinuation<Void, Never>?
 
     init(driver: MemoryDriver) { self.driver = driver }
     func reset() async {}
     func sample() async throws -> HardwareSnapshot {
         samples += 1
+        if holdSample { await withCheckedContinuation { sampleContinuation = $0 } }
         let now = Date()
         driver.value.timestamp = now
         driver.value.fans[0].sampledAt = now
@@ -101,8 +104,9 @@ private final class Fixture {
     }
 
     func close() {
-        service.restoreContinuation?.resume(); service.restoreContinuation = nil
         store.stop()
+        reader.sampleContinuation?.resume(); reader.sampleContinuation = nil
+        service.restoreContinuation?.resume(); service.restoreContinuation = nil
         defaults.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: directory)
     }
@@ -114,6 +118,91 @@ struct LifecycleTests {
         let deadline = Date().addingTimeInterval(5)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
+    }
+
+    @Test func blockedTemperatureReadDoesNotBlockControlHeartbeat() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.reader.holdSample = true
+        f.store.start()
+        try await waitUntil { f.reader.sampleContinuation != nil }
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
+        #expect(f.reader.samples == 1)
+        #expect(f.service.session.status.policies == [f.policy])
+        #expect(f.service.applyCount == 1)
+    }
+
+    @Test(arguments: [true, false])
+    func watchdogRecoveryResumesPresetWithoutSleep(heartbeatExpired: Bool) async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        let preset = FanPreset(name: "编译", model: "test", source: .live, policies: [f.policy])
+        f.store.presets = [preset]
+        try await f.store.apply([f.policy], presetID: preset.id)
+        let uptime = ProcessInfo.processInfo.systemUptime + (heartbeatExpired ? 6 : 3.5)
+        if !heartbeatExpired { f.service.session.heartbeat(client: f.service.client, uptime: uptime) }
+        f.service.session.tick(uptime: uptime, now: Date())
+        #expect(f.driver.value.fans[0].mode == .automatic)
+        f.store.start()
+        try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
+        #expect(f.store.activePresetName == "编译")
+        #expect(f.store.displayPolicies == [f.policy])
+        #expect(f.service.session.status.policies == [f.policy])
+    }
+
+    @Test func connectionLossResumesFullSpeedAfterRecoveryIsConfirmed() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.applyFullSpeed()
+        f.service.disconnect()
+        #expect(f.store.recoveryUnconfirmed)
+        f.store.start()
+        try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
+        #expect(!f.store.recoveryUnconfirmed)
+        #expect(f.store.activeBuiltIn == "full")
+        #expect(f.driver.value.fans[0].target == 6_000)
+    }
+
+    @Test(arguments: [true, false])
+    func thermalOrExternalControlDoesNotResumeAutomatically(thermal: Bool) async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        if !thermal { f.driver.value.fans[0].target = 5_000 }
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: thermal)
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 2 && f.service.requests.contains(.status) }
+        #expect(f.service.applyCount == 1)
+        #expect(f.store.displayPolicies.isEmpty)
+        #expect(f.driver.value.fans[0].mode == .automatic)
+    }
+
+    @Test func explicitAutomaticAfterTimeoutDoesNotResumePreviousPolicy() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 6, now: Date())
+        f.store.restoreAutomatic()
+        try await waitUntil { f.store.displayPolicies.isEmpty && !f.store.controlPending }
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 2 && f.service.requests.contains(.status) }
+        #expect(f.service.applyCount == 1)
+        #expect(f.driver.value.fans[0].mode == .automatic)
+    }
+
+    @Test func failedTimeoutResumeIsNotRepeated() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 6, now: Date())
+        f.service.failApply = true
+        f.store.start()
+        try await waitUntil { f.store.alertMessage != nil }
+        try await waitUntil { f.reader.samples >= 2 }
+        #expect(f.service.applyCount == 2)
+        #expect(f.driver.value.fans[0].mode == .automatic)
+        #expect(f.store.displayPolicies.isEmpty)
     }
 
     @Test(arguments: [FanMode.fixed, .sensor])

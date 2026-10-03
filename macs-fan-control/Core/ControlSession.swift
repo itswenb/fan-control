@@ -12,15 +12,29 @@ public protocol ControlJournal: AnyObject {
     func save(_ fans: Set<String>) throws
 }
 
+public enum RecoveryReason: String, Codable, Sendable {
+    case requested, heartbeatExpired, samplingInterrupted, disconnected, serviceRestarted, thermalEmergency, controlFailure
+
+    public var permitsAutomaticResume: Bool {
+        switch self {
+        case .heartbeatExpired, .samplingInterrupted, .disconnected, .serviceRestarted: true
+        case .requested, .thermalEmergency, .controlFailure: false
+        }
+    }
+}
+
 public struct SessionStatus: Codable, Sendable {
     public var owner: UUID?
     public var policies: [FanPolicy]
     public var pendingRecovery: [String]
     public var message: String?
     public var recoveryBlocked: Bool
-    public init(owner: UUID?, policies: [FanPolicy], pendingRecovery: [String], message: String?, recoveryBlocked: Bool = false) {
+    public var recoveryReason: RecoveryReason?
+    public init(owner: UUID?, policies: [FanPolicy], pendingRecovery: [String], message: String?, recoveryBlocked: Bool = false,
+                recoveryReason: RecoveryReason? = nil) {
         self.owner = owner; self.policies = policies; self.pendingRecovery = pendingRecovery; self.message = message
         self.recoveryBlocked = recoveryBlocked
+        self.recoveryReason = recoveryReason
     }
 }
 
@@ -48,18 +62,20 @@ public final class ControlSession {
     private var lastHeartbeat: TimeInterval = 0
     private var lastTick: TimeInterval?
     private var message: String?
+    private var recoveryReason: RecoveryReason?
     private var retriesRemaining = 0
     private var journalFailure = false
     private var removalOwner: UUID?
     public var preparingRemoval: Bool { removalOwner != nil }
     public var status: SessionStatus {
-        SessionStatus(owner: owner, policies: policies, pendingRecovery: pending.sorted(), message: message, recoveryBlocked: !pending.isEmpty || journalFailure)
+        SessionStatus(owner: owner, policies: policies, pendingRecovery: pending.sorted(), message: message,
+                      recoveryBlocked: !pending.isEmpty || journalFailure, recoveryReason: recoveryReason)
     }
 
     public init(driver: any FanControlDriver, journal: any ControlJournal) throws {
         self.driver = driver; self.journal = journal
         touched = try journal.load()
-        if !touched.isEmpty { recover(reason: "控制服务重新启动，恢复上次接管的风扇。") }
+        if !touched.isEmpty { recover(reason: "控制服务重新启动，恢复上次接管的风扇。", cause: .serviceRestarted) }
     }
 
     public func heartbeat(client: UUID, uptime: TimeInterval) {
@@ -86,9 +102,11 @@ public final class ControlSession {
         owner = client
         policies = requested
         ramps = [:]
+        confirmedTargets = [:]
         lastHeartbeat = uptime
         lastTick = uptime
         message = nil
+        recoveryReason = nil
         do {
             for id in touched.subtracting(toControl) { try driver.restoreAutomatic(fanID: id) }
             touched = toControl
@@ -109,8 +127,18 @@ public final class ControlSession {
             return
         }
         guard owner != nil else { return }
-        if thermalEmergency || uptime - lastHeartbeat > 5 || (lastTick.map { uptime - $0 > 3 } ?? false) {
-            recover(reason: thermalEmergency ? "系统热压力过高，恢复系统控制。" : "控制会话失联或采样中断，恢复系统控制。")
+        if thermalEmergency {
+            recover(reason: "系统热压力过高，恢复系统控制。", cause: .thermalEmergency)
+            return
+        }
+        if uptime - lastHeartbeat > 5 {
+            let gap = String(format: "%.1f", uptime - lastHeartbeat)
+            recover(reason: "客户端心跳超时（\(gap) 秒），恢复系统控制。", cause: .heartbeatExpired)
+            return
+        }
+        if let lastTick, uptime - lastTick > 3 {
+            let gap = String(format: "%.1f", uptime - lastTick)
+            recover(reason: "控制服务采样中断（\(gap) 秒），恢复系统控制。", cause: .samplingInterrupted)
             return
         }
         lastTick = uptime
@@ -124,12 +152,12 @@ public final class ControlSession {
 
     public func release(client: UUID) throws {
         guard owner == nil || owner == client || !pending.isEmpty || journalFailure else { throw SessionError.notOwner }
-        recover(reason: "已请求恢复系统自动。")
+        recover(reason: "已请求恢复系统自动。", cause: .requested)
         guard pending.isEmpty, !journalFailure else { throw SessionError.recoveryRequired }
     }
 
     public func disconnected(client: UUID) {
-        if owner == client { recover(reason: "客户端连接中断，恢复系统自动。") }
+        if owner == client { recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected) }
         if removalOwner == client { removalOwner = nil }
     }
 
@@ -152,6 +180,8 @@ public final class ControlSession {
             var ramp = ramps[fan.id] ?? RampState()
             let commanded = ramp.update(target: target, sampleTime: sensor?.sampledAt ?? now)
             ramps[fan.id] = ramp
+            // 所有权已在本轮读取中核对；目标未变化时无需再次写入和等待 SMC 锁存。
+            if confirmedTargets[fan.id] == commanded { continue }
             try driver.setTarget(fanID: fan.id, rpm: commanded)
             confirmedTargets[fan.id] = commanded
         }
@@ -165,8 +195,9 @@ public final class ControlSession {
         }
     }
 
-    private func recover(reason: String) {
+    private func recover(reason: String, cause: RecoveryReason = .controlFailure) {
         policies = []; ramps = [:]; confirmedTargets = [:]; message = reason
+        recoveryReason = cause
         pending.formUnion(touched)
         retriesRemaining = 4
         retryRecovery()

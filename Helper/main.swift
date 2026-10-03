@@ -142,7 +142,7 @@ private let delegate = Listener(worker: worker, requirement: requirement)
 let listener = NSXPCListener(machServiceName: HelperConstants.machService)
 listener.delegate = delegate
 listener.resume()
-Task {
+Task(priority: .userInitiated) {
     while !Task.isCancelled {
         await worker.tick()
         try? await Task.sleep(for: .seconds(1))
