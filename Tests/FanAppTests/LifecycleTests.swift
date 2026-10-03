@@ -145,15 +145,13 @@ struct LifecycleTests {
         #expect(f.service.applyCount == 1)
     }
 
-    @Test(arguments: [true, false])
-    func watchdogRecoveryResumesPresetWithoutSleep(heartbeatExpired: Bool) async throws {
+    @Test func heartbeatRecoveryResumesPresetWithoutSleep() async throws {
         let f = try Fixture()
         defer { f.close() }
         let preset = FanPreset(name: "编译", model: "test", source: .live, policies: [f.policy])
         f.store.presets = [preset]
         try await f.store.apply([f.policy], presetID: preset.id)
-        let uptime = ProcessInfo.processInfo.systemUptime + (heartbeatExpired ? 6 : 3.5)
-        if !heartbeatExpired { f.service.session.heartbeat(client: f.service.client, uptime: uptime) }
+        let uptime = ProcessInfo.processInfo.systemUptime + 6
         f.service.session.tick(uptime: uptime, now: Date())
         #expect(f.driver.value.fans[0].mode == .automatic)
         f.store.start()
@@ -161,6 +159,21 @@ struct LifecycleTests {
         #expect(f.store.activePresetName == "编译")
         #expect(f.store.displayPolicies == [f.policy])
         #expect(f.service.session.status.policies == [f.policy])
+    }
+
+    @Test func delayedFullSpeedCheckDoesNotRestoreAutomaticOrReapply() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.applyFullSpeed()
+        let uptime = ProcessInfo.processInfo.systemUptime + 3.001
+        f.service.session.heartbeat(client: f.service.client, uptime: uptime)
+        f.service.session.tick(uptime: uptime, now: Date())
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 2 && f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
+        #expect(f.service.applyCount == 1)
+        #expect(f.driver.restores == 0)
+        #expect(f.driver.value.fans[0].mode == .fixed && f.driver.value.fans[0].target == 6_000)
+        #expect(f.store.activeBuiltIn == "full")
     }
 
     @Test func connectionLossResumesFullSpeedAfterRecoveryIsConfirmed() async throws {

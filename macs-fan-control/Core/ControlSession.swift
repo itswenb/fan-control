@@ -61,7 +61,6 @@ public final class ControlSession {
     private var ramps: [String: RampState] = [:]
     private var confirmedTargets: [String: Double] = [:]
     private var lastHeartbeat: TimeInterval = 0
-    private var lastTick: TimeInterval?
     private var message: String?
     private var recoveryReason: RecoveryReason?
     private var retriesRemaining = 0
@@ -108,7 +107,6 @@ public final class ControlSession {
         ramps = [:]
         confirmedTargets = [:]
         lastHeartbeat = uptime
-        lastTick = uptime
         message = nil
         recoveryReason = nil
         do {
@@ -140,13 +138,9 @@ public final class ControlSession {
             recover(reason: "客户端心跳超时（\(gap) 秒），恢复系统控制。", cause: .heartbeatExpired)
             return
         }
-        if let lastTick, uptime - lastTick > 3 {
-            let gap = String(format: "%.1f", uptime - lastTick)
-            recover(reason: "控制服务采样中断（\(gap) 秒），恢复系统控制。", cause: .samplingInterrupted)
-            return
-        }
-        lastTick = uptime
         do {
+            // 定时任务的调度间隔不能证明硬件或采样失效。延迟后读取当前状态，
+            // 再验证温度新鲜度及控制权，避免健康会话先恢复自动再重新应用策略。
             let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
             try PolicyValidator.validate(policies, in: snapshot, at: max(now, snapshot.timestamp))
             try verifyOwnership(in: snapshot)

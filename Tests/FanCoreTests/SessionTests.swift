@@ -130,15 +130,49 @@ struct SessionTests {
         #expect(session.status.recoveryReason == .heartbeatExpired)
     }
 
-    @Test func samplingTimeoutHasItsOwnRecoveryReason() throws {
+    @Test(arguments: [3.001, 3.5, 10.0])
+    func delayedFixedCheckKeepsConfirmedPolicyWhenHeartbeatIsAlive(gap: Double) throws {
         let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
         let session = try ControlSession(driver: driver, journal: MemoryJournal())
         try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 10, now: now)
+        session.heartbeat(client: client, uptime: 10 + gap)
+        session.tick(uptime: 10 + gap, now: now.addingTimeInterval(gap))
+        #expect(session.status.recoveryReason == nil)
+        #expect(session.status.owner == client)
+        #expect(driver.restores.isEmpty)
+        #expect(driver.writes == ["F0"])
+    }
+
+    @Test func delayedTemperatureCheckUsesFreshSampleWithoutRestoringOrReapplying() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: now)
+        let resumedAt = now.addingTimeInterval(3.5)
+        driver.value.sensors[0].celsius = 75
+        driver.value.sensors[0].sampledAt = resumedAt
+        driver.value.timestamp = resumedAt
         session.heartbeat(client: client, uptime: 13.5)
-        session.tick(uptime: 13.5, now: now.addingTimeInterval(3.5))
-        #expect(session.status.recoveryReason == .samplingInterrupted)
-        #expect(session.status.message?.contains("3.5 秒") == true)
+        session.tick(uptime: 13.5, now: resumedAt)
+        #expect(session.status.owner == client)
+        #expect(session.status.recoveryReason == nil)
+        #expect(driver.restores.isEmpty)
+        #expect(driver.value.fans[0].target == 5_400)
+    }
+
+    @Test(arguments: [true, false])
+    func delayedCheckStillStopsOnThermalPressureOrExternalControl(thermal: Bool) throws {
+        let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 10, now: now)
+        if !thermal { driver.value.fans[0].target = 4_000 }
+        session.heartbeat(client: client, uptime: 13.5)
+        session.tick(uptime: 13.5, now: now.addingTimeInterval(3.5), thermalEmergency: thermal)
         #expect(session.status.owner == nil)
+        #expect(session.status.recoveryReason == (thermal ? .thermalEmergency : .controlFailure))
+        #expect(driver.restores == ["F0"])
+        #expect(driver.writes == ["F0"])
     }
 
     @Test func unchangedTargetsStillDetectExternalChangesWithoutRepeatedWrites() throws {
@@ -196,6 +230,8 @@ struct SessionTests {
         session.tick(uptime: 12, now: now.addingTimeInterval(4))
         #expect(session.status.owner == nil)
         #expect(driver.restores.last == "F0")
+        #expect(session.status.recoveryReason == .controlFailure)
+        #expect(session.status.message == ControlError.staleSensor.localizedDescription)
     }
 
     @Test func externalControllerIsNotTakenOver() throws {
