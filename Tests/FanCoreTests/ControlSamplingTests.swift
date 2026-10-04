@@ -42,6 +42,40 @@ private final class SamplingJournal: ControlJournal {
 }
 
 struct ControlSamplingTests {
+    @Test func monitoringReusesLibraryCatalogAndReadsFreshValuesWithoutScanning() throws {
+        let smc = MemorySMC()
+        var catalogCalls = 0
+        let device = SMCDevice(allowWrites: false, connection: smc, monitoringTemperatures: { date in
+            catalogCalls += 1
+            return [SensorReading(id: "Tp01", name: "Library P-Core 1", group: .cpu, celsius: 60, sampledAt: date)]
+        })
+        #expect(try device.snapshot().sensors[0].name == "Library P-Core 1")
+        smc.set("Tp01", 70)
+        smc.reads = []
+        let next = try device.snapshot()
+        #expect(catalogCalls == 1)
+        #expect(next.sensors[0].name == "Library P-Core 1" && next.sensors[0].celsius == 70)
+        #expect(smc.reads.filter { $0.hasPrefix("T") } == ["Tp01"])
+        #expect(smc.writes.isEmpty)
+        device.refreshTemperatureCatalog()
+        _ = try device.snapshot()
+        #expect(catalogCalls == 2)
+    }
+
+    @Test func invalidCachedSensorFallsBackToLibraryWithoutPublishingBadTemperature() throws {
+        let smc = MemorySMC()
+        var catalogCalls = 0
+        let device = SMCDevice(allowWrites: false, connection: smc, monitoringTemperatures: { date in
+            catalogCalls += 1
+            return [SensorReading(id: "Tp01", name: "Library P-Core 1", group: .cpu, celsius: 60, sampledAt: date)]
+        })
+        _ = try device.snapshot()
+        smc.set("Tp01", 6)
+        let next = try device.snapshot()
+        #expect(catalogCalls == 2 && next.sensors[0].celsius == 60)
+        #expect(smc.writes.isEmpty)
+    }
+
     @Test func fixedControlDoesNotInvokeMonitoringOrHIDAndDoesNotRepeatWrites() throws {
         let smc = MemorySMC()
         var monitoringCalls = 0, hidCalls = 0

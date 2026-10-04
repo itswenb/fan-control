@@ -11,7 +11,14 @@ import FanHardware
 
 protocol HardwareSampling: Sendable {
     func sample() async throws -> HardwareSnapshot
+    func sample(temperatureSources: [ControlTemperatureSource]) async throws -> HardwareSnapshot
+    func refreshTemperatureCatalog() async
     func reset() async
+}
+
+extension HardwareSampling {
+    func sample(temperatureSources: [ControlTemperatureSource]) async throws -> HardwareSnapshot { try await sample() }
+    func refreshTemperatureCatalog() async {}
 }
 
 extension SMCReader: HardwareSampling {}
@@ -71,7 +78,12 @@ final class AppStore {
     var connectionError: String?
     var alertMessage: String?
     var presets: [FanPreset] = []
-    var policies: [FanPolicy] = [] { didSet { updateControlActivity() } }
+    var policies: [FanPolicy] = [] {
+        didSet {
+            updateControlActivity()
+            if oldValue.contains(where: { $0.mode != .automatic }) != hasCustomControl { restartHelperPolling() }
+        }
+    }
     private(set) var displayPolicies: [FanPolicy] = []
     private var helperSessionKnown = false
     var activePresetID: UUID?
@@ -88,7 +100,11 @@ final class AppStore {
     var helperAvailable = false
     var helperMessage = ""
     var controlPending = false
-    var recoveryUnconfirmed = false
+    var recoveryUnconfirmed = false {
+        didSet {
+            if oldValue != recoveryUnconfirmed { restartMonitoring(); restartHelperPolling() }
+        }
+    }
     var helperRegistered = false
     var helperInstalling = false
     var helperConnectionFailed = false
@@ -96,6 +112,9 @@ final class AppStore {
         didSet {
             if let data = try? JSONEncoder().encode(settings) { defaults.set(data, forKey: "settings") }
             if oldValue.language != settings.language { refreshHelperRegistration() }
+            if oldValue.menuDisplay != settings.menuDisplay || oldValue.sensorID != settings.sensorID {
+                restartMonitoring()
+            }
         }
     }
 
@@ -106,11 +125,18 @@ final class AppStore {
     @ObservationIgnored private var controlActivity: NSObjectProtocol?
     @ObservationIgnored private var sleepRestoreTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var monitoringGeneration = 0
+    @ObservationIgnored private var detailedMonitoring = true
+    @ObservationIgnored private var menuPresented = false
+    @ObservationIgnored private let deviceIdentity = MacDeviceHardware.deviceHardware.modelIdentifier
+    @ObservationIgnored private let deviceModelName = MacDeviceHardware.deviceHardware.modelName
     @ObservationIgnored private var controlRevision = 0
     @ObservationIgnored private var helperStatusCheck = 0
     @ObservationIgnored private var helperConnectedThisLaunch = false
     @ObservationIgnored private var lastControl: LastControlConfiguration?
-    @ObservationIgnored private var startupRestorePending = true
+    @ObservationIgnored private var startupRestorePending = true {
+        didSet { if oldValue != startupRestorePending { restartMonitoring() } }
+    }
     @ObservationIgnored private var startupRestoreAttempts = 0
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
@@ -164,9 +190,7 @@ final class AppStore {
     }
     var deviceName: String {
         guard let snapshot else { return text("这台 Mac", "This Mac") }
-        let device = MacDeviceHardware.deviceHardware
-        let name = device.modelName
-        return device.modelIdentifier == snapshot.model && name != "Unknown" && !name.isEmpty ? name : snapshot.model
+        return deviceIdentity == snapshot.model && deviceModelName != "Unknown" && !deviceModelName.isEmpty ? deviceModelName : snapshot.model
     }
     var selectedSensor: SensorReading? {
         guard let sensors = snapshot?.sensors else { return nil }
@@ -177,13 +201,13 @@ final class AppStore {
         return settings.fanID.isEmpty ? fans.first : fans.first(where: { $0.id == settings.fanID })
     }
     var menuLines: [String] {
-        let temperature = selectedSensor.map { formattedTemperature($0.celsius, fresh: $0.isFresh(at: now)) } ?? "—"
-        let rpm = selectedFan.map { formattedRPM($0.rpm, fresh: $0.isFresh(at: now)) } ?? "—"
+        func temperature() -> String { selectedSensor.map { formattedTemperature($0.celsius, fresh: $0.isFresh(at: now)) } ?? "—" }
+        func rpm() -> String { (selectedFan.map { formattedRPM($0.rpm, fresh: $0.isFresh(at: now)) } ?? "—") + " RPM" }
         switch settings.menuDisplay {
         case .none: return []
-        case .temperature: return [temperature]
-        case .fan: return [rpm + " RPM"]
-        case .both: return [temperature, rpm + " RPM"]
+        case .temperature: return [temperature()]
+        case .fan: return [rpm()]
+        case .both: return [temperature(), rpm()]
         }
     }
     var menuTitle: String { menuLines.joined(separator: "\n") }
@@ -235,45 +259,126 @@ final class AppStore {
     }
 
     private func beginPolling(resetReader: Bool = false) {
-        pollingTask?.cancel()
         helperPollingTask?.cancel()
         generation += 1
+        restartMonitoring(resetReader: resetReader)
+        restartHelperPolling()
+    }
+
+    private func restartHelperPolling() {
+        guard started, !isSuspended, sleepRestoreTask == nil else { return }
+        helperPollingTask?.cancel()
         let expectedGeneration = generation
-        pollingTask = Task { [weak self] in
-            if resetReader { await self?.reader.reset() }
+        // 监控读取可能较慢或失败；控制租约的心跳必须独立于界面采样。
+        helperPollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
+                self.updateReadingFreshness()
+                self.refreshHelperRegistration()
+                if self.helperRegistered && !self.helperInstalling { await self.refreshHelperSession() }
+                // 后台系统自动状态不轮询；打开窗口/菜单、切换策略或连接失效时再唤醒。
+                guard self.detailedMonitoring || self.menuPresented || self.hasCustomControl || self.recoveryUnconfirmed
+                        || (self.helperRegistered && self.startupRestorePending) || self.helperInstalling else { return }
+                let interval = self.hasCustomControl || self.recoveryUnconfirmed ? 1 : 2
+                try? await Task.sleep(for: .seconds(interval))
+            }
+        }
+    }
+
+    func setDetailedMonitoring(_ visible: Bool) {
+        guard detailedMonitoring != visible else { return }
+        detailedMonitoring = visible
+        restartMonitoring()
+        restartHelperPolling()
+    }
+
+    func setMenuPresented(_ presented: Bool) {
+        guard menuPresented != presented else { return }
+        menuPresented = presented
+        restartMonitoring()
+        restartHelperPolling()
+    }
+
+    private var needsMonitoring: Bool {
+        detailedMonitoring || menuPresented || settings.menuDisplay != .none || needsResumeReadings
+    }
+
+    private var needsResumeReadings: Bool {
+        recoveryUnconfirmed || (startupRestorePending && lastControl?.policies.contains { $0.mode != .automatic } == true)
+    }
+
+    private func restartMonitoring(resetReader: Bool = false) {
+        guard started, !isSuspended, sleepRestoreTask == nil else { return }
+        pollingTask?.cancel()
+        monitoringGeneration += 1
+        let expectedGeneration = generation, expectedMonitoring = monitoringGeneration
+        guard needsMonitoring || snapshot == nil else { pollingTask = nil; return }
+        pollingTask = Task { [weak self] in
+            if resetReader { await self?.reader.reset() }
+            if self?.detailedMonitoring == true { await self?.reader.refreshTemperatureCatalog() }
+            while !Task.isCancelled {
+                guard let self, !self.isSuspended, self.generation == expectedGeneration,
+                      self.monitoringGeneration == expectedMonitoring else { return }
+                let full = self.detailedMonitoring || self.snapshot == nil || self.needsResumeReadings
                 do {
-                    let value = try await self.reader.sample()
-                    guard !Task.isCancelled, self.generation == expectedGeneration else { return }
+                    var value: HardwareSnapshot
+                    if full {
+                        value = try await self.reader.sample()
+                    } else {
+                        let needsTemperature = self.menuPresented || self.settings.menuDisplay == .temperature || self.settings.menuDisplay == .both
+                        let sensor = self.selectedSensor ?? self.snapshot?.sensors.first(where: { self.settings.sensorID.isEmpty ? $0.group == .cpu : $0.id == self.settings.sensorID })
+                        let sources: [ControlTemperatureSource]
+                        if needsTemperature, let snapshot = self.snapshot, let sensor {
+                            sources = (try? ControlTemperatureSource.resolve([FanPolicy(fanID: "", mode: .sensor, sensorID: sensor.id)], in: snapshot)) ?? []
+                        } else { sources = [] }
+                        value = try await self.reader.sample(temperatureSources: sources)
+                        value = self.mergeMonitoringReadings(value)
+                    }
+                    guard !Task.isCancelled, self.generation == expectedGeneration,
+                          self.monitoringGeneration == expectedMonitoring else { return }
                     self.snapshot = value
                     self.now = Date()
                     self.connectionError = nil
                     self.isLoading = false
                 } catch {
-                    guard !Task.isCancelled, self.generation == expectedGeneration else { return }
+                    guard !Task.isCancelled, self.generation == expectedGeneration,
+                          self.monitoringGeneration == expectedMonitoring else { return }
                     if self.connectionError != error.localizedDescription { self.record(error.localizedDescription, error: true) }
                     self.connectionError = error.localizedDescription
                     self.isLoading = false
                 }
+                guard self.needsMonitoring else { return }
                 try? await Task.sleep(for: .seconds(self.connectionError == nil ? 2 : 5))
             }
         }
-        // 监控读取可能较慢或失败；控制租约的心跳必须独立于界面采样。
-        helperPollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
-                self.now = Date()
-                self.refreshHelperRegistration()
-                if self.helperRegistered && !self.helperInstalling { await self.refreshHelperSession() }
-                try? await Task.sleep(for: .seconds(self.hasCustomControl || self.recoveryUnconfirmed ? 1 : 2))
-            }
+    }
+
+    private func updateReadingFreshness() {
+        guard let snapshot else { return }
+        let date = Date()
+        if snapshot.fans.contains(where: { $0.isFresh(at: now) != $0.isFresh(at: date) })
+            || snapshot.sensors.contains(where: { $0.isFresh(at: now) != $0.isFresh(at: date) }) { now = date }
+    }
+
+    private func mergeMonitoringReadings(_ reading: HardwareSnapshot) -> HardwareSnapshot {
+        var value = reading
+        // 名称始终沿用库返回的目录；未采样的测点保持旧时间，不能伪装成新读数。
+        let updates = Dictionary(value.sensors.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        value.sensors = (snapshot?.sensors ?? []).map { previous in
+            guard var update = updates[previous.id] else { return previous }
+            update.name = previous.name
+            return update
         }
+        for index in value.fans.indices {
+            if let previous = snapshot?.fans.first(where: { $0.id == value.fans[index].id }) { value.fans[index].name = previous.name }
+        }
+        return value
     }
 
     func retry() {
         isLoading = true
         guard !isSuspended else { return }
+        started = true
         beginPolling(resetReader: true)
     }
 
@@ -334,13 +439,27 @@ final class AppStore {
     }
 
     func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom") async throws {
-        guard canControl, let snapshot else { throw ControlError.readOnly }
-        try PolicyValidator.validate(newPolicies, in: snapshot, at: Date())
-        let temperatureSources = try ControlTemperatureSource.resolve(newPolicies, in: snapshot)
-        startupRestorePending = false
+        guard canControl, var snapshot else { throw ControlError.readOnly }
         controlPending = true
-        controlRevision += 1
         defer { controlPending = false }
+        let expectedGeneration = generation
+        let temperatureSources = try ControlTemperatureSource.resolve(newPolicies, in: snapshot)
+        let date = Date()
+        let needsFreshFans = newPolicies.contains { policy in
+            policy.mode != .automatic && snapshot.fans.first(where: { $0.id == policy.fanID })?.isFresh(at: date) != true
+        }
+        let needsFreshSensors = temperatureSources.contains { source in snapshot.sensors.first(where: { $0.id == source.id })?.isFresh(at: date) != true }
+        if !detailedMonitoring && (needsFreshFans || needsFreshSensors) {
+            // 后台按用户操作补读所选策略需要的数据，不恢复完整持续采样。
+            let reading = try await reader.sample(temperatureSources: temperatureSources)
+            guard generation == expectedGeneration, !isSuspended, helperAvailable, !recoveryUnconfirmed else { throw ControlError.readOnly }
+            snapshot = mergeMonitoringReadings(reading)
+            self.snapshot = snapshot
+            now = Date()
+        }
+        try PolicyValidator.validate(newPolicies, in: snapshot, at: Date())
+        startupRestorePending = false
+        controlRevision += 1
         let expected = newPolicies.contains(where: { $0.mode != .automatic }) ? newPolicies : []
         do {
             let reply = try await helper.request(HelperRequest(operation: .apply, policies: newPolicies,
@@ -512,7 +631,7 @@ final class AppStore {
             recoveryUnconfirmed = status.recoveryBlocked || (recoveryUnconfirmed && status.owner != nil)
             helperAvailable = reply.available && !recoveryUnconfirmed
             helperMessage = reply.available ? text("控制服务已连接", "Control service connected") : (status.message ?? text("控制暂不可用：未检测到可用的调速接口，或另一连接正在使用服务。", "Control unavailable: no compatible fan control interface or another active connection."))
-            displayPolicies = status.policies
+            if displayPolicies != status.policies { displayPolicies = status.policies }
             if !recoveryUnconfirmed {
                 let wasControlling = hasCustomControl
                 if wasControlling, !reply.ownsSession, status.owner == nil,
@@ -520,7 +639,8 @@ final class AppStore {
                     startupRestorePending = true
                     startupRestoreAttempts = 0
                 }
-                policies = reply.ownsSession ? status.policies : []
+                let ownedPolicies = reply.ownsSession ? status.policies : []
+                if policies != ownedPolicies { policies = ownedPolicies }
                 syncActivePreset()
                 if wasControlling && !reply.ownsSession, let message = status.message { record(message) }
                 if reply.ownsSession {

@@ -143,12 +143,12 @@ struct MenuBarView: View {
             Divider()
             Menu(store.activePresetName) {
                 Button(store.text("系统自动", "System automatic")) {
-                    if !store.canControl { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+                    if !store.canControl { showMainWindow() }
                     store.restoreAutomatic()
                 }
                 Button(store.text("全速散热", "Full speed")) {
                     guard store.canControl else {
-                        openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true)
+                        showMainWindow()
                         store.showControlSetup = true
                         return
                     }
@@ -156,13 +156,13 @@ struct MenuBarView: View {
                         do { try await store.applyFullSpeed() }
                         catch {
                             store.alertMessage = error.localizedDescription
-                            openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true)
+                            showMainWindow()
                         }
                     }
                 }
                 ForEach(store.currentPresets) { preset in
                     Button(preset.name) {
-                        if !store.canControl { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+                        if !store.canControl { showMainWindow() }
                         store.applyPreset(preset)
                     }
                 }
@@ -173,9 +173,10 @@ struct MenuBarView: View {
                 .disabled(!updater.canCheckForUpdates)
             Divider()
             HStack {
-                Button(store.text("打开主窗口", "Open window")) { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
+                Button(store.text("打开主窗口", "Open window")) { showMainWindow() }
                 Spacer()
                 Button {
+                    AppWindowVisibility.prepareToOpen()
                     openSettings()
                     DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
                 } label: {
@@ -189,6 +190,14 @@ struct MenuBarView: View {
                 }
             }
         }.padding(18).frame(width: 320).task { store.start() }
+            .onAppear { store.setMenuPresented(true) }
+            .onDisappear { store.setMenuPresented(false) }
+    }
+
+    private func showMainWindow() {
+        AppWindowVisibility.prepareToOpen()
+        openWindow(id: "main")
+        DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
     }
 }
 

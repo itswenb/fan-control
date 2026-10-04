@@ -131,6 +131,7 @@ public final class SMCDevice: FanControlDriver {
     private let chip = SMCDevice.systemString("machdep.cpu.brand_string")
     private let allowWrites: Bool
     private var supportedFans = Set<String>()
+    private var temperatureLayout: (readings: [SensorReading], sources: [ControlTemperatureSource])?
 
     public init(allowWrites: Bool = false) {
         self.allowWrites = allowWrites
@@ -152,16 +153,39 @@ public final class SMCDevice: FanControlDriver {
     public func reset() {
         connection = nil; temperatureSampler = nil
         supportedFans = []
+        temperatureLayout = nil
     }
+
+    public func refreshTemperatureCatalog() { temperatureLayout = nil }
 
     public func snapshot() throws -> HardwareSnapshot {
         var snapshot = try fanSnapshot(includeNames: true)
+        if let layout = temperatureLayout, let connection {
+            let readings = readTemperatures(layout.sources, connection: connection)
+            if readings.allSatisfy({ $0.celsius != nil }) {
+                snapshot.sensors = zip(layout.readings, readings).map { previous, reading in
+                    var value = reading
+                    value.name = previous.name
+                    return value
+                }
+                snapshot.timestamp = Date()
+                return snapshot
+            }
+            // 测点不可读或失真时仍交给库选择 HID/SMC fallback，不发布缓存温度。
+        }
         if let monitoringTemperatures {
             snapshot.sensors = monitoringTemperatures(Date())
         } else {
             let sampler = temperatureSampler ?? TemperatureSampler()
             temperatureSampler = sampler
             snapshot.sensors = TemperatureAdapter.readings(from: sampler.sample(), at: Date())
+        }
+        if !snapshot.sensors.isEmpty {
+            let policies = snapshot.sensors.map { FanPolicy(fanID: "", mode: .sensor, sensorID: $0.id) }
+            if let sorted = try? ControlTemperatureSource.resolve(policies, in: snapshot) {
+                let sources = snapshot.sensors.compactMap { sensor in sorted.first { $0.id == sensor.id } }
+                temperatureLayout = (snapshot.sensors, sources)
+            }
         }
         snapshot.timestamp = Date()
         return snapshot
@@ -170,6 +194,12 @@ public final class SMCDevice: FanControlDriver {
     public func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
         var snapshot = try fanSnapshot(includeNames: false)
         guard !temperatureSources.isEmpty, let connection else { return snapshot }
+        snapshot.sensors = readTemperatures(temperatureSources, connection: connection)
+        snapshot.timestamp = Date()
+        return snapshot
+    }
+
+    private func readTemperatures(_ temperatureSources: [ControlTemperatureSource], connection: any SMCTransport) -> [SensorReading] {
         let keys = Set(temperatureSources.flatMap(\.keys))
         func isSMCKey(_ key: String) -> Bool { key.hasPrefix("T") && SMCCodec.fourCC(key) != nil }
         var values: [String: (celsius: Double, date: Date)] = [:]
@@ -182,7 +212,7 @@ public final class SMCDevice: FanControlDriver {
                 values[value.name] = (value.celsius, Date())
             }
         }
-        snapshot.sensors = temperatureSources.map { source in
+        return temperatureSources.map { source in
             let category: SensorCategory
             switch source.group {
             case .cpu: category = .cpu
@@ -200,8 +230,6 @@ public final class SMCDevice: FanControlDriver {
                                  celsius: valid ? readings.reduce(0) { $0 + $1.celsius } / Double(readings.count) : nil,
                                  sampledAt: valid ? readings.map(\.date).min() : nil)
         }
-        snapshot.timestamp = Date()
-        return snapshot
     }
 
     private func openConnection() throws -> any SMCTransport {
@@ -305,5 +333,9 @@ public actor SMCReader {
     private let device = SMCDevice()
     public init() {}
     public func reset() { device.reset() }
+    public func refreshTemperatureCatalog() { device.refreshTemperatureCatalog() }
     public func sample() throws -> HardwareSnapshot { try device.snapshot() }
+    public func sample(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
+        try device.controlSnapshot(temperatureSources: temperatureSources)
+    }
 }

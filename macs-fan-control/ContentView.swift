@@ -201,7 +201,7 @@ struct ContentView: View {
         if store.recoveryUnconfirmed { return store.text("恢复系统自动尚未确认", "Automatic mode not yet confirmed") }
         if store.connectionError != nil { return store.text("硬件连接异常", "Hardware connection issue") }
         if store.snapshot == nil { return store.text("正在读取本机硬件", "Reading this Mac") }
-        return store.text("实时数据 · 每秒刷新", "Live readings · Refreshing every second")
+        return store.text("实时数据 · 每 2 秒刷新", "Live readings · Refreshing every 2 seconds")
     }
 }
 

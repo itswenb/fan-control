@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Testing
 import FanCore
 @testable import FanAppModel
@@ -30,6 +31,8 @@ private final class MemoryDriver: FanControlDriver {
 private final class MemoryReader: HardwareSampling {
     let driver: MemoryDriver
     var samples = 0
+    var fullSamples = 0
+    var selectedSources: [[ControlTemperatureSource]] = []
     var stale = false
     var holdSample = false
     var sampleContinuation: CheckedContinuation<Void, Never>?
@@ -37,6 +40,16 @@ private final class MemoryReader: HardwareSampling {
     init(driver: MemoryDriver) { self.driver = driver }
     func reset() async {}
     func sample() async throws -> HardwareSnapshot {
+        fullSamples += 1
+        return try await readSnapshot()
+    }
+    func sample(temperatureSources: [ControlTemperatureSource]) async throws -> HardwareSnapshot {
+        selectedSources.append(temperatureSources)
+        var value = try await readSnapshot()
+        value.sensors = value.sensors.filter { sensor in temperatureSources.contains { $0.id == sensor.id } }
+        return value
+    }
+    private func readSnapshot() async throws -> HardwareSnapshot {
         samples += 1
         if holdSample { await withCheckedContinuation { sampleContinuation = $0 } }
         let now = Date()
@@ -138,11 +151,124 @@ struct LifecycleTests {
         try await f.store.apply([f.policy])
         f.reader.holdSample = true
         f.store.start()
+        let time = f.store.now
         try await waitUntil { f.reader.sampleContinuation != nil }
         try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
         #expect(f.reader.samples == 1)
         #expect(f.service.session.status.policies == [f.policy])
         #expect(f.service.applyCount == 1)
+        #expect(f.store.now == time, "控制心跳不能重复触发整张监控表刷新")
+    }
+
+    @Test func blockedReadStillMarksOldDataStale() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.reader.holdSample = true
+        f.store.start()
+        try await waitUntil { f.store.snapshot?.sensors[0].isFresh(at: f.store.now) == false }
+        #expect(f.store.menuLines[0] == "—")
+        let time = f.store.now
+        let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count > heartbeats }
+        #expect(f.store.now == time, "读数已经失效后不需要每秒重新绘制相同的失效状态")
+        #expect(f.service.applyCount == 1)
+    }
+
+    @Test func iconOnlyMenuDoesNotObserveHardwareReadings() throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.settings.menuDisplay = .none
+        withObservationTracking {
+            #expect(f.store.menuLines.isEmpty)
+        } onChange: {
+            Issue.record("仅图标的菜单栏不应因硬件读数变化而刷新")
+        }
+        f.store.now = Date()
+        f.store.snapshot = f.driver.value
+    }
+
+    @Test func closingIconOnlyWindowStopsMonitoringAndKeepsControlHeartbeat() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.applyFullSpeed()
+        f.store.settings.menuDisplay = .none
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 1 }
+        f.store.setDetailedMonitoring(false)
+        let samples = f.reader.samples
+        let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= heartbeats + 2 }
+        #expect(f.reader.samples == samples)
+        #expect(f.service.applyCount == 1)
+        f.store.setDetailedMonitoring(true)
+        try await waitUntil { f.reader.samples > samples }
+        #expect(f.service.applyCount == 1)
+    }
+
+    @Test func hiddenWindowReadsOnlyMenuSensorAndPreservesLibraryName() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.settings.menuDisplay = .temperature
+        f.store.start()
+        try await waitUntil { f.reader.fullSamples >= 1 }
+        f.store.setDetailedMonitoring(false)
+        let fullSamples = f.reader.fullSamples
+        try await waitUntil { !f.reader.selectedSources.isEmpty }
+        #expect(f.reader.fullSamples == fullSamples)
+        #expect(f.reader.selectedSources.last == [ControlTemperatureSource(id: "T0", group: .cpu, keys: ["T0"])])
+        #expect(f.store.snapshot?.sensors[0].name == "CPU")
+        f.store.setDetailedMonitoring(true)
+        try await waitUntil { f.reader.fullSamples > fullSamples }
+    }
+
+    @Test func backgroundAutomaticStopsPollingAndControlSelectionRestartsHeartbeat() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.settings.menuDisplay = .none
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 1 && f.service.requests.contains(.status) }
+        f.store.setDetailedMonitoring(false)
+        try await Task.sleep(for: .milliseconds(100))
+        let samples = f.reader.samples, requests = f.service.requests.count
+        try await Task.sleep(for: .milliseconds(2_100))
+        #expect(f.reader.samples == samples && f.service.requests.count == requests)
+        try await f.store.applyFullSpeed()
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
+        #expect(f.service.applyCount == 1)
+        #expect(f.reader.samples == samples)
+    }
+
+    @Test func backgroundPresetRefreshesItsStaleSensorOnDemand() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.settings.menuDisplay = .none
+        f.store.setDetailedMonitoring(false)
+        f.store.snapshot?.sensors[0].sampledAt = Date().addingTimeInterval(-10)
+        f.store.snapshot?.fans[0].sampledAt = Date().addingTimeInterval(-10)
+        try await f.store.apply([f.policy])
+        #expect(f.reader.fullSamples == 0)
+        let source = ControlTemperatureSource(id: "T0", group: .cpu, keys: ["T0"])
+        #expect(f.reader.selectedSources == [[source]])
+        #expect(f.service.applyCount == 1)
+    }
+
+    @Test func iconOnlyBackgroundRecoveryObtainsFreshDataAndStopsMonitoringAfterResume() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.settings.menuDisplay = .none
+        try await f.store.applyFullSpeed()
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 1 }
+        f.store.setDetailedMonitoring(false)
+        f.store.snapshot?.fans[0].sampledAt = Date().addingTimeInterval(-10)
+        f.service.disconnect()
+        try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
+        let samples = f.reader.samples
+        let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= heartbeats + 2 }
+        #expect(f.reader.samples == samples)
+        #expect(f.store.activeBuiltIn == "full")
     }
 
     @Test func heartbeatRecoveryResumesPresetWithoutSleep() async throws {

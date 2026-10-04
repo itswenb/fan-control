@@ -7,8 +7,8 @@ final class AppUpdater: ObservableObject {
     @Published private(set) var canCheckForUpdates = false
     private let controller: SPUStandardUpdaterController
 
-    init() {
-        controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    init(startingUpdater: Bool = true) {
+        controller = SPUStandardUpdaterController(startingUpdater: startingUpdater, updaterDelegate: nil, userDriverDelegate: nil)
         controller.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
     }
 
@@ -21,6 +21,7 @@ final class AppUpdater: ObservableObject {
     }
 
     func checkForUpdates() {
+        AppWindowVisibility.prepareToOpen()
         NSApp.activate(ignoringOtherApps: true)
         controller.checkForUpdates(nil)
     }

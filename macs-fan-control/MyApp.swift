@@ -8,7 +8,12 @@ struct MyApp: App {
     @StateObject private var updater = AppUpdater()
 
     init() {
+        #if DEBUG
+        let store = UIInspection.isRequested ? UIInspection.makeStore() : AppStore()
+        _updater = StateObject(wrappedValue: AppUpdater(startingUpdater: !UIInspection.isRequested))
+        #else
         let store = AppStore()
+        #endif
         _store = State(initialValue: store)
         AppLifecycle.store = store
     }
@@ -16,6 +21,9 @@ struct MyApp: App {
     var body: some Scene {
         Window("Fan Control", id: "main") {
             ContentView().environment(store).environmentObject(updater).tint(.accentColor)
+                #if DEBUG
+                .background(UIInspection())
+                #endif
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 900, height: 560)
@@ -57,8 +65,12 @@ struct MenuBarStatusLabel: View {
 }
 
 /// MenuBarExtra 会把复杂标签压成单行；预绘制内容可保持系统菜单栏内的两行排版。
+@MainActor
 enum MenuBarStatusArtwork {
+    private static var cached: (lines: [String], showIcon: Bool, image: NSImage)?
+
     static func make(lines: [String], showIcon: Bool) -> NSImage {
+        if let cached, cached.lines == lines, cached.showIcon == showIcon { return cached.image }
         let font = NSFont.monospacedDigitSystemFont(ofSize: lines.count == 2 ? 9 : 12, weight: .medium)
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
         let widths = lines.map { ceil(($0 as NSString).size(withAttributes: attributes).width) }
@@ -78,6 +90,7 @@ enum MenuBarStatusArtwork {
             return true
         }
         image.isTemplate = true
+        cached = (lines, showIcon, image)
         return image
     }
 }
@@ -87,18 +100,24 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
     static var store: AppStore?
     private var terminating = false
     private var terminationApproved = false
+    private let windows = AppWindowVisibility()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
         if DebugPreview.captureIfRequested() { return }
         #endif
         Self.store?.start()
+        windows.onVisibilityChange = { Self.store?.setDetailedMonitoring($0) }
+        windows.start()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if DEBUG
+        if UIInspection.isRequested { return .terminateNow }
+        #endif
         if terminationApproved { return .terminateNow }
         guard let store = Self.store,
               store.hasCustomControl || store.recoveryUnconfirmed || store.controlPending else { return .terminateNow }
@@ -127,7 +146,7 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         // 先退出当前事件处理，再异步恢复；避免菜单栏操作被 AppKit 的模态退出循环卡住。
         return .terminateCancel
     }
-    func applicationWillTerminate(_ notification: Notification) { Self.store?.stop() }
+    func applicationWillTerminate(_ notification: Notification) { windows.stop(); Self.store?.stop() }
     @objc private func willSleep() { Self.store?.suspend() }
     @objc private func didWake() { Self.store?.resume() }
 }
