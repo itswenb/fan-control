@@ -69,9 +69,43 @@ struct DiagnosticEvent: Identifiable {
     let isError: Bool
 }
 
+/// 稳定的硬件信息与实时读数分开观察，避免每次采样重建窗口和菜单。
+struct HardwareOverview: Equatable {
+    let model: String
+    let chip: String
+    let hasFans: Bool
+    let fanCountKnown: Bool
+    let canControlFans: Bool
+    let hasManualFan: Bool
+    let hasUnknownFanMode: Bool
+}
+
+struct SensorDescriptor: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let group: SensorGroup
+}
+
 @MainActor @Observable
 final class AppStore {
-    var snapshot: HardwareSnapshot?
+    var snapshot: HardwareSnapshot? {
+        didSet {
+            let overview = snapshot.map {
+                HardwareOverview(model: $0.model, chip: $0.chip, hasFans: !$0.fans.isEmpty,
+                                 fanCountKnown: $0.fanCountKnown, canControlFans: $0.fans.contains { $0.controlSupported },
+                                 hasManualFan: $0.fans.contains { $0.mode == .fixed },
+                                 hasUnknownFanMode: $0.fans.contains { $0.mode == nil })
+            }
+            if hardwareOverview != overview {
+                hardwareOverview = overview
+                refreshHelperRegistration()
+            }
+            let catalog = (snapshot?.sensors ?? []).map { SensorDescriptor(id: $0.id, name: $0.name, group: $0.group) }
+            if sensorCatalog != catalog { sensorCatalog = catalog }
+        }
+    }
+    private(set) var hardwareOverview: HardwareOverview?
+    private(set) var sensorCatalog: [SensorDescriptor] = []
     var now = Date()
     var isLoading = true
     var isSuspended = false { didSet { updateControlActivity() } }
@@ -165,6 +199,7 @@ final class AppStore {
             self.helperSessionKnown = false
             self.displayPolicies = []; self.activePresetID = nil; self.activeBuiltIn = "automatic"
             if self.hasCustomControl || self.controlPending { self.recoveryUnconfirmed = true }
+            self.refreshHelperRegistration()
         }
     }
 
@@ -176,7 +211,7 @@ final class AppStore {
     var canRegisterHelper: Bool {
         helper.bundled && helper.signed && (snapshot == nil || snapshot?.fans.contains(where: { $0.controlSupported }) == true)
     }
-    var currentPresets: [FanPreset] { presets.filter { $0.source == .live && $0.model == snapshot?.model } }
+    var currentPresets: [FanPreset] { presets.filter { $0.source == .live && $0.model == hardwareOverview?.model } }
     var hasCustomControl: Bool { policies.contains { $0.mode != .automatic } }
     var activePresetName: String {
         if recoveryUnconfirmed { return text("恢复未确认", "Recovery unconfirmed") }
@@ -184,13 +219,13 @@ final class AppStore {
         if let activePresetID, let preset = presets.first(where: { $0.id == activePresetID }) { return preset.name }
         if activeBuiltIn == "full" { return text("全速散热", "Full speed") }
         if displayPolicies.contains(where: { $0.mode != .automatic }) { return text("自定义 · 未保存", "Custom · Unsaved") }
-        if snapshot?.fans.contains(where: { $0.mode == .fixed }) == true { return text("外部手动控制", "External control") }
-        if snapshot == nil || snapshot?.fans.contains(where: { $0.mode == nil }) == true { return text("模式未确认", "Mode unconfirmed") }
+        if hardwareOverview?.hasManualFan == true { return text("外部手动控制", "External control") }
+        if hardwareOverview == nil || hardwareOverview?.hasUnknownFanMode == true { return text("模式未确认", "Mode unconfirmed") }
         return text("系统自动", "System automatic")
     }
     var deviceName: String {
-        guard let snapshot else { return text("这台 Mac", "This Mac") }
-        return deviceIdentity == snapshot.model && deviceModelName != "Unknown" && !deviceModelName.isEmpty ? deviceModelName : snapshot.model
+        guard let hardwareOverview else { return text("这台 Mac", "This Mac") }
+        return deviceIdentity == hardwareOverview.model && deviceModelName != "Unknown" && !deviceModelName.isEmpty ? deviceModelName : hardwareOverview.model
     }
     var selectedSensor: SensorReading? {
         guard let sensors = snapshot?.sensors else { return nil }
@@ -249,6 +284,10 @@ final class AppStore {
         SensorCatalog.syntheticName(key: sensor.id, english: english) ?? sensor.name
     }
 
+    func sensorName(_ sensor: SensorDescriptor) -> String {
+        SensorCatalog.syntheticName(key: sensor.id, english: english) ?? sensor.name
+    }
+
     func start() {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--capture-preview") { return }
@@ -259,6 +298,7 @@ final class AppStore {
     }
 
     private func beginPolling(resetReader: Bool = false) {
+        refreshHelperRegistration()
         helperPollingTask?.cancel()
         generation += 1
         restartMonitoring(resetReader: resetReader)
@@ -274,7 +314,6 @@ final class AppStore {
             while !Task.isCancelled {
                 guard let self, !self.isSuspended, self.generation == expectedGeneration else { return }
                 self.updateReadingFreshness()
-                self.refreshHelperRegistration()
                 if self.helperRegistered && !self.helperInstalling { await self.refreshHelperSession() }
                 // 后台系统自动状态不轮询；打开窗口/菜单、切换策略或连接失效时再唤醒。
                 guard self.detailedMonitoring || self.menuPresented || self.hasCustomControl || self.recoveryUnconfirmed
@@ -288,6 +327,7 @@ final class AppStore {
     func setDetailedMonitoring(_ visible: Bool) {
         guard detailedMonitoring != visible else { return }
         detailedMonitoring = visible
+        if visible { refreshHelperRegistration() }
         restartMonitoring()
         restartHelperPolling()
     }
@@ -295,6 +335,7 @@ final class AppStore {
     func setMenuPresented(_ presented: Bool) {
         guard menuPresented != presented else { return }
         menuPresented = presented
+        if presented { refreshHelperRegistration() }
         restartMonitoring()
         restartHelperPolling()
     }

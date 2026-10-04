@@ -52,39 +52,11 @@ struct ContentView: View {
     }
 
     var body: some View {
-        @Bindable var store = store
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: "laptopcomputer")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 40, height: 40)
-                    .glassControl(radius: 11)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(store.deviceName).font(.headline)
-                    Text(store.snapshot?.chip ?? "Fan Control").font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                HStack(spacing: 6) {
-                    Text(store.text("当前预设", "Preset")).foregroundStyle(.secondary)
-                    PresetMenu()
-                }
-                Menu {
-                    Button(store.text("保存当前配置…", "Save current configuration…")) { store.showSavePreset = true }
-                        .disabled(store.snapshot?.fans.isEmpty != false)
-                    Button(store.text("管理预设…", "Manage presets…")) { store.showPresets = true }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .frame(width: 32, height: 32)
-                }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
-                    .frame(width: 32, height: 32)
-                    .glassControl(radius: 10)
-                    .accessibilityLabel(store.text("预设操作", "Preset actions"))
-            }.padding(.horizontal, 18).frame(height: 72)
+            MainHeader()
             GeometryReader { geometry in
                 HStack(spacing: 12) {
-                    fanTable
+                    FanTable(editingFan: $editingFan)
                         .frame(width: max(480, geometry.size.width * 0.58))
                         .dataPanel()
                     SensorsView()
@@ -94,26 +66,7 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 12)
             }
-            HStack(spacing: 10) {
-                Circle().fill(store.connectionError == nil ? Color.accentColor : .orange).frame(width: 6, height: 6)
-                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                Spacer()
-                if store.controlPending { ProgressView().controlSize(.small) }
-                Button(store.text("恢复自动", "Restore automatic")) { store.restoreAutomatic() }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.primary)
-                    .padding(.horizontal, 14).frame(height: 30)
-                    .glassControl(radius: 9)
-                    .disabled(store.controlPending || store.snapshot?.fans.isEmpty != false)
-                Button { store.showDiagnostics = true } label: {
-                    Image(systemName: "info.circle").frame(width: 32, height: 30).glassControl(radius: 9)
-                }.buttonStyle(.plain).help(store.text("连接诊断", "Connection diagnostics"))
-                    .accessibilityLabel(store.text("连接诊断", "Connection diagnostics"))
-                SettingsLink {
-                    Image(systemName: "gearshape").frame(width: 32, height: 30).glassControl(radius: 9)
-                }.buttonStyle(.plain).help(store.text("设置", "Settings"))
-                    .accessibilityLabel(store.text("设置", "Settings"))
-            }.padding(.horizontal, 18).frame(height: 50)
+            MainFooter()
         }
         .background(WindowBackdrop().ignoresSafeArea())
         .frame(minWidth: 860, minHeight: 480)
@@ -133,7 +86,82 @@ struct ContentView: View {
         .task { store.start() }
     }
 
-    private var fanTable: some View {
+}
+
+private struct MainHeader: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "laptopcomputer")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 40, height: 40)
+                .glassControl(radius: 11)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.deviceName).font(.headline)
+                Text(store.hardwareOverview?.chip ?? "Fan Control").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            HStack(spacing: 6) {
+                Text(store.text("当前预设", "Preset")).foregroundStyle(.secondary)
+                PresetMenu()
+            }
+            Menu {
+                Button(store.text("保存当前配置…", "Save current configuration…")) { store.showSavePreset = true }
+                    .disabled(store.hardwareOverview?.hasFans != true)
+                Button(store.text("管理预设…", "Manage presets…")) { store.showPresets = true }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 32, height: 32)
+            }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                .frame(width: 32, height: 32)
+                .glassControl(radius: 10)
+                .accessibilityLabel(store.text("预设操作", "Preset actions"))
+        }.padding(.horizontal, 18).frame(height: 72)
+    }
+}
+
+private struct MainFooter: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle().fill(store.connectionError == nil ? Color.accentColor : .orange).frame(width: 6, height: 6)
+            Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Spacer()
+            if store.controlPending { ProgressView().controlSize(.small) }
+            Button(store.text("恢复自动", "Restore automatic")) { store.restoreAutomatic() }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.primary)
+                .padding(.horizontal, 14).frame(height: 30)
+                .glassControl(radius: 9)
+                .disabled(store.controlPending || store.hardwareOverview?.hasFans != true)
+            Button { store.showDiagnostics = true } label: {
+                Image(systemName: "info.circle").frame(width: 32, height: 30).glassControl(radius: 9)
+            }.buttonStyle(.plain).help(store.text("连接诊断", "Connection diagnostics"))
+                .accessibilityLabel(store.text("连接诊断", "Connection diagnostics"))
+            SettingsLink {
+                Image(systemName: "gearshape").frame(width: 32, height: 30).glassControl(radius: 9)
+            }.buttonStyle(.plain).help(store.text("设置", "Settings"))
+                .accessibilityLabel(store.text("设置", "Settings"))
+        }.padding(.horizontal, 18).frame(height: 50)
+    }
+
+    private var statusText: String {
+        if store.recoveryUnconfirmed { return store.text("恢复系统自动尚未确认", "Automatic mode not yet confirmed") }
+        if store.connectionError != nil { return store.text("硬件连接异常", "Hardware connection issue") }
+        if store.hardwareOverview == nil { return store.text("正在读取本机硬件", "Reading this Mac") }
+        return store.text("实时数据 · 每 2 秒刷新", "Live readings · Refreshing every 2 seconds")
+    }
+}
+
+private struct FanTable: View {
+    @Environment(AppStore.self) private var store
+    @Binding var editingFan: FanReading?
+
+    var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text(store.text("风扇", "Fan")).frame(maxWidth: .infinity, alignment: .leading)
@@ -197,12 +225,6 @@ struct ContentView: View {
         return store.modeName(fan.mode)
     }
 
-    private var statusText: String {
-        if store.recoveryUnconfirmed { return store.text("恢复系统自动尚未确认", "Automatic mode not yet confirmed") }
-        if store.connectionError != nil { return store.text("硬件连接异常", "Hardware connection issue") }
-        if store.snapshot == nil { return store.text("正在读取本机硬件", "Reading this Mac") }
-        return store.text("实时数据 · 每 2 秒刷新", "Live readings · Refreshing every 2 seconds")
-    }
 }
 
 struct PresetMenu: View {
@@ -261,30 +283,6 @@ struct SensorsView: View {
     @State private var search = ""
     @State private var byTemperature = false
     @State private var showUnidentified = false
-    private var sensors: [SensorReading] {
-        let values = (store.snapshot?.sensors ?? []).filter {
-            let known = SensorCatalog.averageRank(key: $0.id) != nil || $0.name != $0.id
-            return (showUnidentified || known || !search.isEmpty) && (search.isEmpty || store.sensorName($0).localizedCaseInsensitiveContains(search) || $0.id.localizedCaseInsensitiveContains(search))
-        }
-        if byTemperature {
-            return values.sorted {
-                if let first = SensorCatalog.averageRank(key: $0.id) {
-                    return first < (SensorCatalog.averageRank(key: $1.id) ?? Int.max)
-                }
-                if SensorCatalog.averageRank(key: $1.id) != nil { return false }
-                return ($0.celsius ?? -.infinity) > ($1.celsius ?? -.infinity)
-            }
-        }
-        return values.sorted {
-            if let first = SensorCatalog.averageRank(key: $0.id) {
-                return first < (SensorCatalog.averageRank(key: $1.id) ?? Int.max)
-            }
-            if SensorCatalog.averageRank(key: $1.id) != nil { return false }
-            let firstGroup = SensorGroup.allCases.firstIndex(of: $0.group) ?? 0
-            let secondGroup = SensorGroup.allCases.firstIndex(of: $1.group) ?? 0
-            return firstGroup == secondGroup ? store.sensorName($0).localizedStandardCompare(store.sensorName($1)) == .orderedAscending : firstGroup < secondGroup
-        }
-    }
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -304,25 +302,85 @@ struct SensorsView: View {
                 TextField(store.text("搜索传感器", "Search sensors"), text: $search).textFieldStyle(.plain)
             }.padding(8).glassControl(radius: 9).padding(10)
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(sensors.enumerated()), id: \.element.id) { index, sensor in
-                        HStack(spacing: 8) {
-                            Text(store.sensorName(sensor)).lineLimit(1).help(store.sensorName(sensor) + " · " + sensor.id)
-                            Spacer(minLength: 4)
-                            Text(store.formattedTemperature(sensor.celsius, fresh: sensor.isFresh(at: store.now)))
-                                .monospacedDigit().frame(width: 62, alignment: .trailing)
-                            Button { store.settings.sensorID = sensor.id } label: {
-                                Image(systemName: store.settings.sensorID == sensor.id ? "pin.fill" : "pin")
-                                    .foregroundStyle(store.settings.sensorID == sensor.id ? Color.accentColor : .secondary)
-                            }.buttonStyle(.plain).frame(width: 16).help(store.text("在菜单栏显示", "Show in menu bar"))
-                        }.font(.callout).padding(.horizontal, 14).frame(height: 32)
-                            .background(index.isMultiple(of: 2) ? Color.primary.opacity(0.025) : .clear)
-                    }
-                    if sensors.isEmpty {
-                        Text(store.text("暂无匹配的传感器", "No matching sensors")).foregroundStyle(.secondary).padding(20)
-                    }
-                }
+                SensorList(search: search, byTemperature: byTemperature, showUnidentified: showUnidentified)
             }
         }
+    }
+}
+
+/// 默认顺序只依赖目录和搜索条件；实时温度仅刷新末端数值。
+private struct SensorList: View {
+    @Environment(AppStore.self) private var store
+    let search: String
+    let byTemperature: Bool
+    let showUnidentified: Bool
+
+    private var sensors: [SensorDescriptor] {
+        let values = store.sensorCatalog.filter {
+            let known = SensorCatalog.averageRank(key: $0.id) != nil || $0.name != $0.id
+            return (showUnidentified || known || !search.isEmpty) && (search.isEmpty || store.sensorName($0).localizedCaseInsensitiveContains(search) || $0.id.localizedCaseInsensitiveContains(search))
+        }
+        if byTemperature {
+            let temperatures = Dictionary((store.snapshot?.sensors ?? []).compactMap { sensor in
+                sensor.celsius.map { (sensor.id, $0) }
+            }, uniquingKeysWith: { _, latest in latest })
+            return values.sorted {
+                if let first = SensorCatalog.averageRank(key: $0.id) {
+                    return first < (SensorCatalog.averageRank(key: $1.id) ?? Int.max)
+                }
+                if SensorCatalog.averageRank(key: $1.id) != nil { return false }
+                return (temperatures[$0.id] ?? -.infinity) > (temperatures[$1.id] ?? -.infinity)
+            }
+        }
+        return values.sorted {
+            if let first = SensorCatalog.averageRank(key: $0.id) {
+                return first < (SensorCatalog.averageRank(key: $1.id) ?? Int.max)
+            }
+            if SensorCatalog.averageRank(key: $1.id) != nil { return false }
+            let firstGroup = SensorGroup.allCases.firstIndex(of: $0.group) ?? 0
+            let secondGroup = SensorGroup.allCases.firstIndex(of: $1.group) ?? 0
+            return firstGroup == secondGroup ? store.sensorName($0).localizedStandardCompare(store.sensorName($1)) == .orderedAscending : firstGroup < secondGroup
+        }
+    }
+    var body: some View {
+        let values = sensors
+        LazyVStack(spacing: 0) {
+            ForEach(Array(values.enumerated()), id: \.element.id) { index, sensor in
+                SensorRow(sensor: sensor, alternating: index.isMultiple(of: 2))
+            }
+            if values.isEmpty {
+                Text(store.text("暂无匹配的传感器", "No matching sensors")).foregroundStyle(.secondary).padding(20)
+            }
+        }
+    }
+}
+
+private struct SensorRow: View {
+    @Environment(AppStore.self) private var store
+    let sensor: SensorDescriptor
+    let alternating: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(store.sensorName(sensor)).lineLimit(1).help(store.sensorName(sensor) + " · " + sensor.id)
+            Spacer(minLength: 4)
+            SensorTemperature(sensorID: sensor.id)
+                .monospacedDigit().frame(width: 62, alignment: .trailing)
+            Button { store.settings.sensorID = sensor.id } label: {
+                Image(systemName: store.settings.sensorID == sensor.id ? "pin.fill" : "pin")
+                    .foregroundStyle(store.settings.sensorID == sensor.id ? Color.accentColor : .secondary)
+            }.buttonStyle(.plain).frame(width: 16).help(store.text("在菜单栏显示", "Show in menu bar"))
+        }.font(.callout).padding(.horizontal, 14).frame(height: 32)
+            .background(alternating ? Color.primary.opacity(0.025) : .clear)
+    }
+}
+
+private struct SensorTemperature: View {
+    @Environment(AppStore.self) private var store
+    let sensorID: String
+
+    var body: some View {
+        let sensor = store.snapshot?.sensors.first { $0.id == sensorID }
+        Text(store.formattedTemperature(sensor?.celsius, fresh: sensor?.isFresh(at: store.now) == true))
     }
 }

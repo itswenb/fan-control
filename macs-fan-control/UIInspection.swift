@@ -15,6 +15,10 @@ struct UIInspection: View {
     static func makeStore() -> AppStore {
         let suite = "FanControl.Inspection." + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
+        if ProcessInfo.processInfo.arguments.contains("--inspect-current-settings"),
+           let settings = UserDefaults.standard.data(forKey: "settings") {
+            defaults.set(settings, forKey: "settings")
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
         cleanup = {
             defaults.removePersistentDomain(forName: suite)

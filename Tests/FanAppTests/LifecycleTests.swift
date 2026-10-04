@@ -62,7 +62,12 @@ private final class MemoryReader: HardwareSampling {
 
 @MainActor
 private final class MemoryService: ControlServiceConnection {
-    let bundled = true, signed = true, installed = true
+    let signed = true
+    var bundleChecks = 0
+    var installationChecks = 0
+    var isInstalled = true
+    var bundled: Bool { bundleChecks += 1; return true }
+    var installed: Bool { installationChecks += 1; return isInstalled }
     var onDisconnect: (() -> Void)?
     let session: ControlSession
     let client = UUID()
@@ -132,6 +137,70 @@ struct LifecycleTests {
         let deadline = Date().addingTimeInterval(5)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
+    }
+
+    @Test func liveReadingsDoNotInvalidateHardwareInformationOrSensorCatalog() throws {
+        let f = try Fixture()
+        defer { f.close() }
+        withObservationTracking {
+            _ = f.store.deviceName
+            _ = f.store.hardwareOverview
+            _ = f.store.currentPresets
+            _ = f.store.activePresetName
+            _ = f.store.sensorCatalog
+        } onChange: {
+            Issue.record("温度、转速和时间戳变化不能触发静态标题、菜单或目录刷新")
+        }
+        var value = f.driver.value
+        value.sensors[0].celsius = 63
+        value.sensors[0].sampledAt = Date()
+        value.fans[0].rpm = 2_500
+        value.timestamp = Date()
+        f.store.snapshot = value
+        f.store.now = Date()
+        #expect(f.store.snapshot?.sensors[0].celsius == 63)
+        #expect(f.store.snapshot?.fans[0].rpm == 2_500)
+    }
+
+    @Test func hardwareInformationTracksModeAndCatalogChanges() throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.service.isInstalled = false
+        var value = f.driver.value
+        value.fans[0].mode = .fixed
+        value.sensors[0].name = "CPU Die"
+        value.sensors.append(SensorReading(id: "T1", name: "Battery", group: .battery, celsius: 30, sampledAt: Date()))
+        f.store.snapshot = value
+        #expect(f.store.activePresetName == f.store.text("外部手动控制", "External control"))
+        #expect(f.store.sensorCatalog.map(\.name) == ["CPU Die", "Battery"])
+        value.sensors.removeFirst()
+        value.fans.removeAll()
+        f.store.snapshot = value
+        #expect(f.store.sensorCatalog.map(\.id) == ["T1"])
+        #expect(f.store.hardwareOverview?.hasFans == false)
+        f.store.snapshot = nil
+        #expect(f.store.hardwareOverview == nil && f.store.sensorCatalog.isEmpty)
+    }
+
+    @Test func healthyHeartbeatsDoNotPollInstallationAndReopeningChecksIt() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.applyFullSpeed()
+        f.store.start()
+        try await waitUntil { f.reader.samples >= 1 && f.service.requests.filter { $0 == .heartbeat }.count >= 1 }
+        let bundleChecks = f.service.bundleChecks, installationChecks = f.service.installationChecks
+        let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= heartbeats + 2 }
+        #expect(f.service.bundleChecks == bundleChecks)
+        #expect(f.service.installationChecks == installationChecks)
+        #expect(f.service.applyCount == 1)
+        f.service.isInstalled = false
+        f.store.setDetailedMonitoring(false)
+        f.store.setDetailedMonitoring(true)
+        #expect(!f.store.helperRegistered && !f.store.helperAvailable)
+        f.service.isInstalled = true
+        f.store.setMenuPresented(true)
+        #expect(f.store.helperRegistered)
     }
 
     @Test func healthySessionDoesNotReapplyPolicyWhenMonitoringRefreshes() async throws {
