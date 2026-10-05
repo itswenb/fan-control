@@ -118,6 +118,11 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         Self.store?.start()
         windows.onVisibilityChange = { Self.store?.setDetailedMonitoring($0) }
         windows.start()
+        #if DEBUG
+        if UIInspection.isRequested {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { UIInspection.describeWindowsIfRequested() }
+        }
+        #endif
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
     }

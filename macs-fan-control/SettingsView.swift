@@ -59,17 +59,17 @@ struct SettingsView: View {
                 }
                 Picker(store.text("温度来源", "Temperature source"), selection: $store.settings.sensorID) {
                     Text(store.text("首个可用传感器", "First available sensor")).tag("")
-                    if !store.settings.sensorID.isEmpty, !(store.snapshot?.sensors.contains { $0.id == store.settings.sensorID } ?? false) {
+                    if !store.settings.sensorID.isEmpty, !store.sensorCatalog.contains(where: { $0.id == store.settings.sensorID }) {
                         Text(store.settings.sensorID + store.text("（不可用）", " (unavailable)")).tag(store.settings.sensorID)
                     }
-                    ForEach(store.snapshot?.sensors ?? []) { Text(store.sensorName($0)).tag($0.id) }
+                    ForEach(store.sensorCatalog) { Text(store.sensorName($0)).tag($0.id) }
                 }
                 Picker(store.text("风扇", "Fan"), selection: $store.settings.fanID) {
                     Text(store.text("第一只风扇", "First fan")).tag("")
-                    if !store.settings.fanID.isEmpty, !(store.snapshot?.fans.contains { $0.id == store.settings.fanID } ?? false) {
+                    if !store.settings.fanID.isEmpty, !store.fanCatalog.contains(where: { $0.id == store.settings.fanID }) {
                         Text(store.settings.fanID + store.text("（不可用）", " (unavailable)")).tag(store.settings.fanID)
                     }
-                    ForEach(store.snapshot?.fans ?? []) { Text(store.fanName($0)).tag($0.id) }
+                    ForEach(store.fanCatalog) { Text(store.fanName($0)).tag($0.id) }
                 }
             }
             Section {
@@ -111,33 +111,8 @@ struct MenuBarView: View {
                 Spacer()
                 Text(store.deviceName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            if let sensor = store.selectedSensor {
-                HStack {
-                    Text(store.sensorName(sensor)).foregroundStyle(.secondary)
-                    Spacer()
-                    Text(store.formattedTemperature(sensor.celsius, fresh: sensor.isFresh(at: store.now))).monospacedDigit()
-                }
-            }
-            ForEach(store.snapshot?.fans ?? []) { fan in
-                let current = store.formattedRPM(fan.rpm, fresh: fan.isFresh(at: store.now))
-                let maximum = store.formattedRPM(fan.maximum)
-                HStack {
-                    Text(store.fanName(fan)).foregroundStyle(.secondary)
-                    Spacer()
-                    HStack(alignment: .firstTextBaseline, spacing: 1) {
-                        Text(current).font(.body.weight(.medium)).foregroundStyle(.primary)
-                        Text("/" + maximum + " RPM").font(.caption).foregroundStyle(.secondary)
-                    }
-                    .monospacedDigit().fixedSize()
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(store.text("当前转速 \(current) RPM，最大转速 \(maximum) RPM", "Current speed \(current) RPM, maximum speed \(maximum) RPM"))
-                }
-            }
-            if store.snapshot == nil { Text(store.text("暂无硬件读数", "No hardware readings")).foregroundStyle(.secondary) }
-            if !store.settings.sensorID.isEmpty && store.selectedSensor == nil {
-                Label(store.text("所选温度传感器不可用", "Selected temperature sensor unavailable"), systemImage: "exclamationmark.circle").foregroundStyle(.orange)
-            } else if let sensor = store.selectedSensor, !sensor.isFresh(at: store.now) {
-                Label(store.text("温度读数已失效", "Temperature reading unavailable or stale"), systemImage: "clock.badge.exclamationmark").foregroundStyle(.orange)
+            if store.menuPresented {
+                MenuBarReadings()
             }
             if store.connectionError != nil { Label(store.text("硬件连接异常", "Hardware connection issue"), systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
             Divider()
@@ -190,6 +165,9 @@ struct MenuBarView: View {
                 }
             }
         }.padding(18).frame(width: 320).task { store.start() }
+            #if DEBUG
+            .background(UIInspection(isMenu: true))
+            #endif
             .onAppear { store.setMenuPresented(true) }
             .onDisappear { store.setMenuPresented(false) }
     }
@@ -198,6 +176,44 @@ struct MenuBarView: View {
         AppWindowVisibility.prepareToOpen()
         openWindow(id: "main")
         DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
+    }
+}
+
+/// 实时读数仅在弹窗打开时观察，不让采样重建菜单操作和隐藏的视图。
+private struct MenuBarReadings: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let sensor = store.selectedSensor {
+                HStack {
+                    Text(store.sensorName(sensor)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(store.formattedTemperature(sensor.celsius, fresh: sensor.isFresh(at: store.now))).monospacedDigit()
+                }
+            }
+            ForEach(store.snapshot?.fans ?? []) { fan in
+                let current = store.formattedRPM(fan.rpm, fresh: fan.isFresh(at: store.now))
+                let maximum = store.formattedRPM(fan.maximum)
+                HStack {
+                    Text(store.fanName(fan)).foregroundStyle(.secondary)
+                    Spacer()
+                    HStack(alignment: .firstTextBaseline, spacing: 1) {
+                        Text(current).font(.body.weight(.medium)).foregroundStyle(.primary)
+                        Text("/" + maximum + " RPM").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .monospacedDigit().fixedSize()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(store.text("当前转速 \(current) RPM，最大转速 \(maximum) RPM", "Current speed \(current) RPM, maximum speed \(maximum) RPM"))
+                }
+            }
+            if store.snapshot == nil { Text(store.text("暂无硬件读数", "No hardware readings")).foregroundStyle(.secondary) }
+            if !store.settings.sensorID.isEmpty && store.selectedSensor == nil {
+                Label(store.text("所选温度传感器不可用", "Selected temperature sensor unavailable"), systemImage: "exclamationmark.circle").foregroundStyle(.orange)
+            } else if let sensor = store.selectedSensor, !sensor.isFresh(at: store.now) {
+                Label(store.text("温度读数已失效", "Temperature reading unavailable or stale"), systemImage: "clock.badge.exclamationmark").foregroundStyle(.orange)
+            }
+        }
     }
 }
 

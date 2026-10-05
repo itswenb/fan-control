@@ -86,6 +86,22 @@ struct SensorDescriptor: Identifiable, Equatable {
     let group: SensorGroup
 }
 
+struct FanDescriptor: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let minimum: Double?
+    let maximum: Double?
+    let controlSupported: Bool
+
+    init(_ fan: FanReading) {
+        id = fan.id
+        name = fan.name
+        minimum = fan.minimum
+        maximum = fan.maximum
+        controlSupported = fan.controlSupported
+    }
+}
+
 @MainActor @Observable
 final class AppStore {
     var snapshot: HardwareSnapshot? {
@@ -102,10 +118,14 @@ final class AppStore {
             }
             let catalog = (snapshot?.sensors ?? []).map { SensorDescriptor(id: $0.id, name: $0.name, group: $0.group) }
             if sensorCatalog != catalog { sensorCatalog = catalog }
+            let fans = (snapshot?.fans ?? []).map(FanDescriptor.init)
+            if fanCatalog != fans { fanCatalog = fans }
         }
     }
     private(set) var hardwareOverview: HardwareOverview?
     private(set) var sensorCatalog: [SensorDescriptor] = []
+    private(set) var fanCatalog: [FanDescriptor] = []
+    private(set) var menuPresented = false
     var now = Date()
     var isLoading = true
     var isSuspended = false { didSet { updateControlActivity() } }
@@ -161,7 +181,6 @@ final class AppStore {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var monitoringGeneration = 0
     @ObservationIgnored private var detailedMonitoring = true
-    @ObservationIgnored private var menuPresented = false
     @ObservationIgnored private let deviceIdentity = MacDeviceHardware.deviceHardware.modelIdentifier
     @ObservationIgnored private let deviceModelName = MacDeviceHardware.deviceHardware.modelName
     @ObservationIgnored private var controlRevision = 0
@@ -209,7 +228,7 @@ final class AppStore {
     func text(_ chinese: String, _ english: String) -> String { self.english ? english : chinese }
     var canControl: Bool { helperAvailable && snapshot != nil && !isSuspended && connectionError == nil && !controlPending && !recoveryUnconfirmed }
     var canRegisterHelper: Bool {
-        helper.bundled && helper.signed && (snapshot == nil || snapshot?.fans.contains(where: { $0.controlSupported }) == true)
+        helper.bundled && helper.signed && (hardwareOverview == nil || hardwareOverview?.canControlFans == true)
     }
     var currentPresets: [FanPreset] { presets.filter { $0.source == .live && $0.model == hardwareOverview?.model } }
     var hasCustomControl: Bool { policies.contains { $0.mode != .automatic } }
@@ -274,7 +293,11 @@ final class AppStore {
         }
     }
     func fanName(_ fan: FanReading) -> String {
-        if let name = SensorCatalog.fanName(id: fan.id, model: snapshot?.model ?? "", english: english) { return name }
+        fanName(FanDescriptor(fan))
+    }
+
+    func fanName(_ fan: FanDescriptor) -> String {
+        if let name = SensorCatalog.fanName(id: fan.id, model: hardwareOverview?.model ?? "", english: english) { return name }
         guard english else { return fan.name }
         if fan.name == "左侧风扇" { return "Left fan" }
         if fan.name == "右侧风扇" { return "Right fan" }

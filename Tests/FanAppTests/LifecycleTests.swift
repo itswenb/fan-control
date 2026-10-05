@@ -148,6 +148,8 @@ struct LifecycleTests {
             _ = f.store.currentPresets
             _ = f.store.activePresetName
             _ = f.store.sensorCatalog
+            _ = f.store.fanCatalog.map { f.store.fanName($0) }
+            _ = f.store.canRegisterHelper
         } onChange: {
             Issue.record("温度、转速和时间戳变化不能触发静态标题、菜单或目录刷新")
         }
@@ -168,16 +170,25 @@ struct LifecycleTests {
         f.service.isInstalled = false
         var value = f.driver.value
         value.fans[0].mode = .fixed
+        value.fans[0].name = "Exhaust fan"
+        value.fans[0].maximum = 6_200
         value.sensors[0].name = "CPU Die"
         value.sensors.append(SensorReading(id: "T1", name: "Battery", group: .battery, celsius: 30, sampledAt: Date()))
         f.store.snapshot = value
         #expect(f.store.activePresetName == f.store.text("外部手动控制", "External control"))
         #expect(f.store.sensorCatalog.map(\.name) == ["CPU Die", "Battery"])
+        #expect(f.store.fanCatalog.first?.name == "Exhaust fan")
+        #expect(f.store.fanCatalog.first?.maximum == 6_200)
+        value.fans[0].controlSupported = false
+        f.store.snapshot = value
+        #expect(!f.store.canRegisterHelper)
+        #expect(f.store.fanCatalog.first?.controlSupported == false)
         value.sensors.removeFirst()
         value.fans.removeAll()
         f.store.snapshot = value
         #expect(f.store.sensorCatalog.map(\.id) == ["T1"])
         #expect(f.store.hardwareOverview?.hasFans == false)
+        #expect(f.store.fanCatalog.isEmpty)
         f.store.snapshot = nil
         #expect(f.store.hardwareOverview == nil && f.store.sensorCatalog.isEmpty)
     }

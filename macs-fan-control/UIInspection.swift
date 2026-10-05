@@ -11,12 +11,27 @@ struct UIInspection: View {
     static var isRequested: Bool { ProcessInfo.processInfo.arguments.contains("--inspect-ui") }
     private static var started = false
     private static var cleanup: (() -> Void)?
+    private let isMenu: Bool
+
+    init(isMenu: Bool = false) { self.isMenu = isMenu }
+
+    static func describeWindowsIfRequested() {
+        let args = ProcessInfo.processInfo.arguments
+        guard isRequested, let index = args.firstIndex(of: "--inspect-ui"), args.indices.contains(index + 1) else { return }
+        let windows = NSApp.windows.map {
+            ["number": $0.windowNumber, "class": NSStringFromClass(type(of: $0)),
+             "visible": $0.isVisible, "title": $0.title] as [String: Any]
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: windows, options: [.prettyPrinted]) {
+            try? data.write(to: URL(fileURLWithPath: args[index + 1] + ".windows.json"))
+        }
+    }
 
     static func makeStore() -> AppStore {
         let suite = "FanControl.Inspection." + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
         if ProcessInfo.processInfo.arguments.contains("--inspect-current-settings"),
-           let settings = UserDefaults.standard.data(forKey: "settings") {
+           let settings = UserDefaults(suiteName: "com.itswenb.fancontrol")?.data(forKey: "settings") {
             defaults.set(settings, forKey: "settings")
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
@@ -33,7 +48,8 @@ struct UIInspection: View {
 
     var body: some View {
         Color.clear.onAppear {
-            guard Self.isRequested, !Self.started else { return }
+            guard Self.isRequested, !Self.started,
+                  isMenu == ProcessInfo.processInfo.arguments.contains("--inspect-menu-only") else { return }
             Self.started = true
             Task { await run() }
         }
@@ -43,49 +59,91 @@ struct UIInspection: View {
         var result: [String: Any] = [:]
         let profileCPU = !ProcessInfo.processInfo.arguments.contains("--inspect-windows-only")
         result["cpuMeasured"] = profileCPU
-        do {
-            try await Task.sleep(for: .seconds(5))
-            if profileCPU { result["openCPUPercent"] = try await measureCPU() }
-            let main = try requireWindow()
-            main.performClose(nil)
-            try await Task.sleep(for: .seconds(1))
-            result["closedDockHidden"] = NSApp.activationPolicy() == .accessory
-            if profileCPU { result["closedCPUPercent"] = try await measureCPU() }
-            AppLifecycle.store?.settings.menuDisplay = .none
-            if profileCPU { result["iconOnlyClosedCPUPercent"] = try await measureCPU() }
-            AppWindowVisibility.prepareToOpen()
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
-            try await Task.sleep(for: .seconds(1))
-            let reopened = try requireWindow()
-            result["reopened"] = reopened.isVisible && NSApp.activationPolicy() == .regular
-            let canMinimize = reopened.styleMask.contains(.miniaturizable)
-                && reopened.standardWindowButton(.miniaturizeButton)?.isEnabled == true
-            result["supportsMinimize"] = canMinimize
-            if canMinimize {
-                reopened.performMiniaturize(nil)
-                try await Task.sleep(for: .seconds(1))
-                result["minimized"] = reopened.isMiniaturized
-                result["activeBeforeRestore"] = NSApp.isActive
-                result["minimizeActionKeepsDock"] = NSApp.activationPolicy() == .regular
-                reopened.deminiaturize(nil)
-                try await Task.sleep(for: .seconds(1))
-                result["visibleAfterRestoreAction"] = !reopened.isMiniaturized && reopened.isVisible
+        result["version"] = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+        result["pid"] = ProcessInfo.processInfo.processIdentifier
+        func save() {
+            if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "--inspect-ui"),
+               ProcessInfo.processInfo.arguments.indices.contains(index + 1),
+               let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: ProcessInfo.processInfo.arguments[index + 1]))
             }
-            openSettings()
-            try await Task.sleep(for: .seconds(1))
-            reopened.close()
-            try await Task.sleep(for: .seconds(1))
-            result["settingsKeepsDock"] = NSApp.activationPolicy() == .regular
-            for window in NSApp.windows where window.styleMask.contains(.titled) { window.close() }
-            try await Task.sleep(for: .seconds(1))
-            result["allClosedDockHidden"] = NSApp.activationPolicy() == .accessory
-        } catch { result["error"] = error.localizedDescription }
-        if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "--inspect-ui"),
-           ProcessInfo.processInfo.arguments.indices.contains(index + 1),
-           let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: ProcessInfo.processInfo.arguments[index + 1]))
         }
+        do {
+            if isMenu {
+                try await Task.sleep(for: .seconds(5))
+                result["nativeMenuPresented"] = AppLifecycle.store?.menuPresented == true
+                if profileCPU { result["menuOpenCPU"] = try await measureCPU() }
+                result["awaitingMenuClose"] = true
+                save()
+                let deadline = ProcessInfo.processInfo.systemUptime + 45
+                while AppLifecycle.store?.menuPresented == true, ProcessInfo.processInfo.systemUptime < deadline {
+                    try await Task.sleep(for: .milliseconds(200))
+                }
+                result["menuClosed"] = AppLifecycle.store?.menuPresented == false
+                guard AppLifecycle.store?.menuPresented == false else { throw CocoaError(.validationMissingMandatoryProperty) }
+                try await Task.sleep(for: .seconds(3))
+                if profileCPU { result["afterMenuClosedCPU"] = try await measureCPU() }
+            } else {
+                AppWindowVisibility.prepareToOpen()
+                openWindow(id: "main")
+                try await Task.sleep(for: .seconds(5))
+                let main = try requireWindow()
+                main.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                try await Task.sleep(for: .seconds(3))
+                result["mainVisible"] = main.occlusionState.contains(.visible)
+                if profileCPU { result["openCPU"] = try await measureCPU() }
+                save()
+                openSettings()
+                try await Task.sleep(for: .seconds(3))
+                let settings = NSApp.windows.first { $0.isVisible && $0.styleMask.contains(.titled) && $0 !== main }
+                guard let settings else { throw CocoaError(.validationMissingMandatoryProperty) }
+                result["settingsVisible"] = settings.occlusionState.contains(.visible)
+                if profileCPU { result["mainAndSettingsCPU"] = try await measureCPU() }
+                save()
+                main.performClose(nil)
+                try await Task.sleep(for: .seconds(3))
+                if profileCPU { result["settingsOnlyCPU"] = try await measureCPU() }
+                save()
+                settings.close()
+                try await Task.sleep(for: .seconds(3))
+                result["closedDockHidden"] = NSApp.activationPolicy() == .accessory
+                if profileCPU { result["closedCPU"] = try await measureCPU() }
+                save()
+                AppLifecycle.store?.settings.menuDisplay = .none
+                try await Task.sleep(for: .seconds(3))
+                if profileCPU { result["iconOnlyClosedCPU"] = try await measureCPU() }
+                save()
+                AppWindowVisibility.prepareToOpen()
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+                try await Task.sleep(for: .seconds(1))
+                let reopened = try requireWindow()
+                result["reopened"] = reopened.isVisible && NSApp.activationPolicy() == .regular
+                let canMinimize = reopened.styleMask.contains(.miniaturizable)
+                    && reopened.standardWindowButton(.miniaturizeButton)?.isEnabled == true
+                result["supportsMinimize"] = canMinimize
+                if canMinimize {
+                    reopened.performMiniaturize(nil)
+                    try await Task.sleep(for: .seconds(1))
+                    result["minimized"] = reopened.isMiniaturized
+                    result["activeBeforeRestore"] = NSApp.isActive
+                    result["minimizeActionKeepsDock"] = NSApp.activationPolicy() == .regular
+                    reopened.deminiaturize(nil)
+                    try await Task.sleep(for: .seconds(1))
+                    result["visibleAfterRestoreAction"] = !reopened.isMiniaturized && reopened.isVisible
+                }
+                openSettings()
+                try await Task.sleep(for: .seconds(1))
+                reopened.close()
+                try await Task.sleep(for: .seconds(1))
+                result["settingsKeepsDock"] = NSApp.activationPolicy() == .regular
+                for window in NSApp.windows where window.styleMask.contains(.titled) { window.close() }
+                try await Task.sleep(for: .seconds(1))
+                result["allClosedDockHidden"] = NSApp.activationPolicy() == .accessory
+            }
+        } catch { result["error"] = error.localizedDescription }
+        save()
         AppLifecycle.store?.stop()
         Self.cleanup?()
         NSApp.terminate(nil)
@@ -98,16 +156,29 @@ struct UIInspection: View {
         return window
     }
 
-    private func measureCPU() async throws -> Double {
+    private func measureCPU() async throws -> [String: Any] {
         func cpuTime() -> Double {
             var usage = rusage()
             getrusage(RUSAGE_SELF, &usage)
             return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
                 + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
         }
+        let args = ProcessInfo.processInfo.arguments
+        let seconds = args.firstIndex(of: "--inspect-seconds").flatMap {
+            args.indices.contains($0 + 1) ? Double(args[$0 + 1]) : nil
+        } ?? 40
         let cpu = cpuTime(), start = ProcessInfo.processInfo.systemUptime
-        try await Task.sleep(for: .seconds(20))
-        return (cpuTime() - cpu) / (ProcessInfo.processInfo.systemUptime - start) * 100
+        var previousCPU = cpu, previousTime = start, samples: [Double] = []
+        while ProcessInfo.processInfo.systemUptime - start < seconds {
+            try await Task.sleep(for: .seconds(2))
+            let currentCPU = cpuTime(), currentTime = ProcessInfo.processInfo.systemUptime
+            samples.append((currentCPU - previousCPU) / (currentTime - previousTime) * 100)
+            previousCPU = currentCPU
+            previousTime = currentTime
+        }
+        return ["averagePercent": (previousCPU - cpu) / (previousTime - start) * 100,
+                "seconds": previousTime - start, "twoSecondPercent": samples,
+                "maximumPercent": samples.max() ?? 0]
     }
 }
 

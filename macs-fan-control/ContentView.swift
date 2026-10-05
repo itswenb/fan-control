@@ -169,13 +169,13 @@ private struct FanTable: View {
                 Text(store.text("控制策略", "Control")).frame(width: 150)
             }.font(.caption.weight(.medium)).foregroundStyle(.secondary).padding(.horizontal, 16).frame(height: 38)
             Divider()
-            if store.isLoading && store.snapshot == nil {
+            if store.isLoading && store.hardwareOverview == nil {
                 ProgressView(store.text("读取风扇…", "Reading fans…")).frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if store.snapshot?.fans.isEmpty != false {
+            } else if store.fanCatalog.isEmpty {
                 ContentUnavailableView(store.text("暂无风扇读数", "No fan readings"), systemImage: "fan.slash",
                                        description: Text(store.connectionError ?? store.text("这台设备没有可读取的风扇。", "No readable fans were found on this device.")))
             } else {
-                ForEach(Array((store.snapshot?.fans ?? []).enumerated()), id: \.element.id) { index, fan in
+                ForEach(Array(store.fanCatalog.enumerated()), id: \.element.id) { index, fan in
                     HStack(spacing: 8) {
                         Image(systemName: "fan.fill").font(.title2).foregroundStyle(Color.accentColor).frame(width: 24)
                         Text(store.fanName(fan)).font(.callout.weight(.medium)).lineLimit(1)
@@ -183,13 +183,13 @@ private struct FanTable: View {
                         HStack(spacing: 5) {
                             Text(store.formattedRPM(fan.minimum)).foregroundStyle(.secondary)
                             Text("/").foregroundStyle(.tertiary)
-                            Text(store.formattedRPM(fan.rpm, fresh: fan.isFresh(at: store.now))).fontWeight(.semibold)
+                            FanCurrentSpeed(fanID: fan.id).fontWeight(.semibold)
                             Text("/").foregroundStyle(.tertiary)
                             Text(store.formattedRPM(fan.maximum)).foregroundStyle(.secondary)
                         }.font(.system(size: 12)).monospacedDigit().frame(width: 180)
-                        Button { editingFan = fan } label: {
+                        Button { editingFan = store.snapshot?.fans.first { $0.id == fan.id } } label: {
                             HStack(spacing: 6) {
-                                Text(controlLabel(fan)).lineLimit(1)
+                                FanControlLabel(fanID: fan.id).lineLimit(1)
                                 Spacer(minLength: 0)
                                 Image(systemName: "slider.horizontal.3").font(.caption)
                             }.foregroundStyle(Color.primary)
@@ -208,13 +208,33 @@ private struct FanTable: View {
                     if !store.helperAvailable {
                         Text(store.helperMessage).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         Button(store.helperConnectionFailed ? store.text("修复控制服务…", "Repair control service…") : store.text("启用风扇控制…", "Enable fan control…")) { store.showControlSetup = true }
-                    } else if !store.hasCustomControl && store.snapshot?.fans.contains(where: { $0.mode == .fixed }) == true {
+                    } else if !store.hasCustomControl && store.hardwareOverview?.hasManualFan == true {
                         Label(store.text("其他工具正在调速，请先在该工具中恢复自动并退出。", "Another utility is controlling the fans. Restore automatic there and quit it first."), systemImage: "info.circle")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
             }
         }.frame(maxHeight: .infinity)
+    }
+
+}
+
+private struct FanCurrentSpeed: View {
+    @Environment(AppStore.self) private var store
+    let fanID: String
+
+    var body: some View {
+        let fan = store.snapshot?.fans.first { $0.id == fanID }
+        Text(store.formattedRPM(fan?.rpm, fresh: fan?.isFresh(at: store.now) == true))
+    }
+}
+
+private struct FanControlLabel: View {
+    @Environment(AppStore.self) private var store
+    let fanID: String
+
+    var body: some View {
+        Text(store.snapshot?.fans.first { $0.id == fanID }.map(controlLabel) ?? store.modeName(nil))
     }
 
     private func controlLabel(_ fan: FanReading) -> String {
