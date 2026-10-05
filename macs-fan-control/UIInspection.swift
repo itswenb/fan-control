@@ -98,6 +98,9 @@ struct UIInspection: View {
                 try await Task.sleep(for: .seconds(3))
                 let settings = NSApp.windows.first { $0.isVisible && $0.styleMask.contains(.titled) && $0 !== main }
                 guard let settings else { throw CocoaError(.validationMissingMandatoryProperty) }
+                settings.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                try await Task.sleep(for: .seconds(2))
                 result["settingsVisible"] = settings.occlusionState.contains(.visible)
                 if profileCPU { result["mainAndSettingsCPU"] = try await measureCPU() }
                 save()

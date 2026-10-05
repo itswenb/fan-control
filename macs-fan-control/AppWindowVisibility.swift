@@ -27,8 +27,10 @@ final class AppWindowVisibility: NSObject {
         } else if !hasWindow, hideDockWhenEmpty, NSApp.activationPolicy() != .accessory {
             NSApp.setActivationPolicy(.accessory)
         }
-        // 最小化窗口仍在 Dock，但不需要持续刷新完整监控列表。
-        onVisibilityChange?(windows.contains { $0.isVisible && !$0.isMiniaturized })
+        // 设置只使用稳定目录；主监控窗口被遮挡、在其他桌面或最小化时按菜单需求采样。
+        onVisibilityChange?(windows.contains {
+            $0.title == "Fan Control" && $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        })
     }
 
     @objc private func windowChanged() { refresh() }
