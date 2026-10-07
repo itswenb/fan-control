@@ -125,7 +125,10 @@ final class HelperClient: ControlServiceConnection {
                 }
             }
         }
-        if let error = response.error { throw HelperClientError.remote(error) }
+        if let error = response.error {
+            if request.operation == .apply, response.readingsNotReady == true { throw HelperClientError.readingsNotReady }
+            throw HelperClientError.remote(error)
+        }
         return response
     }
 
@@ -166,12 +169,13 @@ final class HelperClient: ControlServiceConnection {
 }
 
 enum HelperClientError: Error, LocalizedError {
-    case timeout, disconnected, remote(String)
+    case timeout, disconnected, remote(String), readingsNotReady
     var errorDescription: String? {
         switch self {
         case .timeout: "控制服务响应超时，硬件状态未确认。"
         case .disconnected: "控制服务连接中断，等待服务恢复系统控制。"
         case .remote(let message): message
+        case .readingsNotReady: SessionError.readingsNotReady.localizedDescription
         }
     }
 }

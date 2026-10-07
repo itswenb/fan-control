@@ -191,6 +191,7 @@ final class AppStore {
         didSet { if oldValue != startupRestorePending { restartMonitoring() } }
     }
     @ObservationIgnored private var startupRestoreAttempts = 0
+    @ObservationIgnored private var lastRestoreSample: Date?
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let helper: any ControlServiceConnection
@@ -469,6 +470,7 @@ final class AppStore {
         snapshot = nil
         startupRestorePending = true
         startupRestoreAttempts = 0
+        lastRestoreSample = nil
         record(text("系统已唤醒，等待最新读数后恢复上次策略。", "System awake. Waiting for fresh readings to resume the last policy."))
         let expectedGeneration = generation
         Task {
@@ -530,6 +532,7 @@ final class AppStore {
                                                              temperatureSources: temperatureSources))
             guard reply.status?.recoveryBlocked == false, reply.status?.policies == expected else { throw SessionError.recoveryRequired }
         } catch {
+            if let error = error as? HelperClientError, case .readingsNotReady = error { throw error }
             helper.disconnect()
             recoveryUnconfirmed = true
             helperAvailable = false
@@ -702,6 +705,7 @@ final class AppStore {
                    status.recoveryReason?.permitsAutomaticResume == true {
                     startupRestorePending = true
                     startupRestoreAttempts = 0
+                    lastRestoreSample = nil
                 }
                 let ownedPolicies = reply.ownsSession ? status.policies : []
                 if policies != ownedPolicies { policies = ownedPolicies }
@@ -746,7 +750,7 @@ final class AppStore {
               defaults.string(forKey: "automaticHelperRepairAttemptedBuild") != identity else { return }
         if let clientError = error as? HelperClientError {
             switch clientError {
-            case .timeout, .remote: return
+            case .timeout, .remote, .readingsNotReady: return
             case .disconnected: break
             }
         }
@@ -810,6 +814,9 @@ final class AppStore {
             startupRestorePending = false
             return
         }
+        // 同一个样本只校验一次；心跳更快不能提前耗尽唤醒后的三个采样机会。
+        guard lastRestoreSample != snapshot.timestamp else { return }
+        lastRestoreSample = snapshot.timestamp
         do {
             try lastControl.validateForResume(in: snapshot, at: Date())
         } catch {
@@ -822,7 +829,7 @@ final class AppStore {
             }
             return
         }
-        // 实际写入只尝试一次；失败后交给现有恢复流程，不循环重新应用。
+        // 一旦实际写入失败就停止；只有服务明确确认尚未写入时才等待下个新样本。
         startupRestorePending = false
         let selection = PresetSelection.resolve(policies: lastControl.policies, in: snapshot, presets: presets,
                                                 preferredID: lastControl.presetID, preferFullSpeed: lastControl.fullSpeed)
@@ -831,6 +838,14 @@ final class AppStore {
             try await apply(lastControl.policies, presetID: id, builtIn: selection == .fullSpeed ? "full" : "custom")
             record(text("已恢复上次使用的策略。", "Resumed the last selected policy."))
         } catch {
+            if let error = error as? HelperClientError, case .readingsNotReady = error {
+                startupRestoreAttempts += 1
+                if startupRestoreAttempts < 3 {
+                    // 服务明确确认没有写入；等待下一份新样本，不重连或反复应用已生效策略。
+                    startupRestorePending = true
+                    return
+                }
+            }
             let message = text("上次策略恢复失败：", "Unable to resume the last policy: ") + error.localizedDescription
             alertMessage = message
             record(message, error: true)

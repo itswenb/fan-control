@@ -32,6 +32,8 @@ public struct HelperReply: Codable, Sendable {
     public var available: Bool
     public var status: SessionStatus?
     public var error: String?
+    /// 仅表示 apply 的写入前校验失败；旧服务没有此字段时按普通错误处理。
+    public var readingsNotReady: Bool?
     public var ownsSession = false
     public init(available: Bool, status: SessionStatus? = nil, error: String? = nil) {
         self.available = available; self.status = status; self.error = error

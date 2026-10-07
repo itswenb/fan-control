@@ -8,6 +8,11 @@ private final class MemorySMC: SMCTransport {
     var reads: [String] = []
     var writes: [String] = []
     var ignoreWrites = false
+    var transientValues: [String: (type: String, bytes: [UInt8])] = [:]
+    var unavailableOnNextRead = Set<String>()
+    var cachedUnavailable = Set<String>()
+    var reopens = 0
+    var onReopen: (() -> Void)?
 
     init() {
         values["FNum"] = ("ui8 ", [2])
@@ -25,6 +30,9 @@ private final class MemorySMC: SMCTransport {
     }
     func read(_ key: String) throws -> (type: String, bytes: [UInt8]) {
         reads.append(key)
+        if unavailableOnNextRead.remove(key) != nil { cachedUnavailable.insert(key) }
+        guard !cachedUnavailable.contains(key) else { throw HardwareError.invalidResponse }
+        if let transient = transientValues.removeValue(forKey: key) { return transient }
         guard let value = values[key] else { throw HardwareError.invalidResponse }
         return value
     }
@@ -32,6 +40,11 @@ private final class MemorySMC: SMCTransport {
         writes.append(key)
         guard let value = values[key] else { throw HardwareError.invalidResponse }
         if !ignoreWrites { values[key] = (value.type, bytes) }
+    }
+    func reopen() throws {
+        reopens += 1
+        cachedUnavailable.removeAll()
+        onReopen?()
     }
 }
 
@@ -126,7 +139,85 @@ struct ControlSamplingTests {
         #expect(smc.reads.filter { $0 == "Tp01" }.count == 1)
         #expect(smc.reads.filter { $0 == "Tp09" }.count == 1)
         #expect(!smc.reads.contains("Tg05"))
+        #expect(smc.reopens == 0)
         #expect(hidCalls == 0)
+    }
+
+    @Test func transientSMCReadIsRetriedOnceWithoutDroppingAverageMembersOrRewritingTargets() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let session = try ControlSession(driver: device, journal: journal)
+        let source = ControlTemperatureSource(id: SensorCatalog.cpuAverageKey, group: .cpu, keys: ["Tp01", "Tp09"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        let writes = smc.writes
+        smc.reads = []
+        smc.transientValues["Tp09"] = ("flt ", [0, 0, 0, 0])
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(session.status.owner == client)
+        #expect(smc.writes == writes)
+        #expect(smc.reads.filter { $0 == "Tp01" }.count == 2)
+        #expect(smc.reads.filter { $0 == "Tp09" }.count == 2)
+        #expect(!smc.reads.contains("Tg05"))
+        #expect(smc.reopens == 1)
+    }
+
+    @Test func temporarilyUnavailableKeyAfterPowerRecoveryIsNotCachedForever() throws {
+        let smc = MemorySMC(), client = UUID()
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let session = try ControlSession(driver: device, journal: SamplingJournal())
+        let source = ControlTemperatureSource(id: SensorCatalog.cpuAverageKey, group: .cpu, keys: ["Tp01", "Tp09"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        let writes = smc.writes
+        smc.unavailableOnNextRead.insert("Tp09")
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(smc.reopens == 1 && smc.cachedUnavailable.isEmpty)
+        #expect(session.status.owner == client && smc.writes == writes)
+    }
+
+    @Test func reconnectingTemperatureReadRechecksFanOwnershipBeforeWriting() throws {
+        let smc = MemorySMC(), client = UUID()
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let session = try ControlSession(driver: device, journal: SamplingJournal())
+        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        smc.transientValues["Tp01"] = ("flt ", [0, 0, 0, 0])
+        smc.onReopen = { smc.set("F0Tg", 5_000) }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(smc.reopens == 1)
+        #expect(session.status.owner == nil && session.status.policies.isEmpty)
+        #expect(smc.values["F0md"]?.bytes == [0])
+        smc.onReopen = nil
+    }
+
+    @Test func invalidPreflightDoesNotClaimSessionOrWriteJournalAndFans() throws {
+        let smc = MemorySMC(), journal = SamplingJournal()
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let session = try ControlSession(driver: device, journal: journal)
+        smc.set("Tp09", 0)
+        let source = ControlTemperatureSource(id: SensorCatalog.cpuAverageKey, group: .cpu, keys: ["Tp01", "Tp09"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        #expect(throws: SessionError.readingsNotReady) {
+            try session.apply([policy], temperatureSources: [source], client: UUID(), uptime: 10, now: Date())
+        }
+        #expect(session.status.owner == nil && session.status.policies.isEmpty)
+        #expect(journal.fans.isEmpty && smc.writes.isEmpty)
+        #expect(smc.reads.filter { $0 == "Tp09" }.count == 2)
+    }
+
+    @Test func legacyReplyWithoutReadinessFlagRemainsAnOrdinaryFailure() throws {
+        let reply = HelperReply(available: true, error: "温度失效")
+        let encoded = try JSONEncoder().encode(reply)
+        let old = try JSONDecoder().decode(HelperReply.self, from: encoded)
+        #expect(old.readingsNotReady == nil && old.error != nil)
+        var rejected = reply
+        rejected.readingsNotReady = true
+        #expect(try JSONDecoder().decode(HelperReply.self, from: JSONEncoder().encode(rejected)).readingsNotReady == true)
     }
 
     @Test func libraryIOFTTemperatureKeysRemainUsableForControl() throws {

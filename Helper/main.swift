@@ -78,7 +78,12 @@ private actor HelperWorker {
                                       client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
                 }
             }
-        } catch { response.error = error.localizedDescription }
+        } catch {
+            response.error = error.localizedDescription
+            if let error = error as? SessionError, case .readingsNotReady = error {
+                response.readingsNotReady = true
+            }
+        }
         response.status = session?.status
         if !device.controlAvailable, response.status?.message == nil {
             response.status?.message = "未检测到可用的风扇调速接口或有效转速范围，目前仅支持监控。"

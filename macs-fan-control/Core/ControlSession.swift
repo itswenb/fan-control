@@ -39,13 +39,14 @@ public struct SessionStatus: Codable, Sendable {
 }
 
 public enum SessionError: Error, LocalizedError {
-    case busy, recoveryRequired, externallyControlled, notOwner
+    case busy, recoveryRequired, externallyControlled, notOwner, readingsNotReady
     public var errorDescription: String? {
         switch self {
         case .busy: "另一个会话正在控制风扇。"
         case .recoveryRequired: "上次控制尚未确认恢复，暂时不能应用新策略。"
         case .externallyControlled: "风扇正在被其他控制器接管，或模式无法确认。请先恢复系统自动。"
         case .notOwner: "当前连接不是风扇控制会话的所有者。"
+        case .readingsNotReady: "控制服务尚未读到有效温度，未写入风扇策略。"
         }
     }
 }
@@ -90,7 +91,11 @@ public final class ControlSession {
         guard pending.isEmpty, !journalFailure else { throw SessionError.recoveryRequired }
         try ControlTemperatureSource.validate(temperatureSources, for: requested)
         let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
-        try PolicyValidator.validate(requested, in: snapshot, at: max(now, snapshot.timestamp))
+        do { try PolicyValidator.validate(requested, in: snapshot, at: max(now, snapshot.timestamp)) }
+        catch ControlError.staleSensor {
+            // 仅此位置保证尚未写恢复日志、取得会话或写入风扇；写入后的故障不能重试。
+            throw SessionError.readingsNotReady
+        }
         do { try verifyOwnership(in: snapshot) }
         catch { recover(reason: error.localizedDescription); throw error }
         for policy in requested where !touched.contains(policy.fanID) {

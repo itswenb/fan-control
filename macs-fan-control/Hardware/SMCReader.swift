@@ -20,6 +20,7 @@ public enum HardwareError: Error, LocalizedError {
 protocol SMCTransport: AnyObject {
     func read(_ key: String) throws -> (type: String, bytes: [UInt8])
     func write(_ key: String, bytes: [UInt8]) throws
+    func reopen() throws
 }
 
 /// 读取和控制共用消息布局。上层只读实例不开放任何写入能力。
@@ -30,11 +31,20 @@ private final class SMCConnection: SMCTransport {
     private var unavailableKeys = Set<String>()
 
     init() throws {
+        try reopen()
+    }
+
+    func reopen() throws {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
         guard service != 0 else { throw HardwareError.unavailable }
         defer { IOObjectRelease(service) }
-        let result = IOServiceOpen(service, mach_task_self_, 0, &port)
+        var freshPort: io_connect_t = 0
+        let result = IOServiceOpen(service, mach_task_self_, 0, &freshPort)
         guard result == KERN_SUCCESS else { throw HardwareError.connection(result) }
+        if port != 0 { IOServiceClose(port) }
+        port = freshPort
+        metadata.removeAll()
+        unavailableKeys.removeAll()
     }
 
     deinit { if port != 0 { IOServiceClose(port) } }
@@ -96,6 +106,8 @@ private final class SMCConnection: SMCTransport {
 }
 
 extension SMCTransport {
+    func reopen() throws {}
+
     func number(_ key: String) -> Double? {
         guard let value = try? read(key) else { return nil }
         return SMCCodec.decode(type: value.type, bytes: value.bytes)
@@ -195,6 +207,13 @@ public final class SMCDevice: FanControlDriver {
         var snapshot = try fanSnapshot(includeNames: false)
         guard !temperatureSources.isEmpty, let connection else { return snapshot }
         snapshot.sensors = readTemperatures(temperatureSources, connection: connection)
+        if snapshot.sensors.contains(where: { !$0.isFresh(at: Date()) }) {
+            // 低电量深睡或重新上电后端口/不可用键缓存可能失效；只重开一次并重新读取。
+            // 同时复核风扇控制权，不沿用旧温度、不跳过测点、不扫描或持续重试。
+            try connection.reopen()
+            snapshot = try fanSnapshot(includeNames: false)
+            snapshot.sensors = readTemperatures(temperatureSources, connection: connection)
+        }
         snapshot.timestamp = Date()
         return snapshot
     }

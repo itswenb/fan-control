@@ -13,6 +13,7 @@ private final class MemoryJournal: ControlJournal {
 private final class MemoryDriver: FanControlDriver {
     var value: HardwareSnapshot
     var restores = 0
+    var staleControlReads = 0
 
     init() {
         let now = Date()
@@ -22,7 +23,16 @@ private final class MemoryDriver: FanControlDriver {
                                  sensors: [SensorReading(id: "T0", name: "CPU", group: .cpu, celsius: 55, sampledAt: now)], timestamp: now)
     }
 
-    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot { value }
+    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
+        if !temperatureSources.isEmpty, staleControlReads > 0 {
+            staleControlReads -= 1
+            var reading = value
+            reading.sensors[0].celsius = nil
+            reading.sensors[0].sampledAt = nil
+            return reading
+        }
+        return value
+    }
     func setTarget(fanID: String, rpm: Double) throws { value.fans[0].mode = .fixed; value.fans[0].target = rpm }
     func restoreAutomatic(fanID: String) throws { restores += 1; value.fans[0].mode = .automatic }
 }
@@ -74,21 +84,24 @@ private final class MemoryService: ControlServiceConnection {
     var requests: [HelperRequest.Operation] = []
     var holdRestore = false
     var failApply = false
+    var disconnects = 0
     var restoreContinuation: CheckedContinuation<Void, Never>?
     var applyCount: Int { requests.filter { $0 == .apply }.count }
 
     init(driver: MemoryDriver) throws { session = try ControlSession(driver: driver, journal: MemoryJournal()) }
     func register() async throws {}
     func unregister(connectionFailed: Bool) async throws {}
-    func disconnect() { session.disconnected(client: client); onDisconnect?() }
+    func disconnect() { disconnects += 1; session.disconnected(client: client); onDisconnect?() }
 
     func request(_ request: HelperRequest) async throws -> HelperReply {
         requests.append(request.operation)
         switch request.operation {
         case .apply:
             if failApply { throw ControlError.invalidRPM }
-            try session.apply(request.policies, temperatureSources: request.temperatureSources,
-                              client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+            do {
+                try session.apply(request.policies, temperatureSources: request.temperatureSources,
+                                  client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+            } catch SessionError.readingsNotReady { throw HelperClientError.readingsNotReady }
         case .restore:
             if holdRestore { await withCheckedContinuation { restoreContinuation = $0 } }
             try session.release(client: client)
@@ -133,8 +146,8 @@ private final class Fixture {
 
 @MainActor
 struct LifecycleTests {
-    private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(5)
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
     }
@@ -492,13 +505,60 @@ struct LifecycleTests {
         try await f.store.apply([f.policy])
         f.reader.stale = true
         f.store.suspend(); f.store.resume()
-        try await waitUntil { f.store.alertMessage != nil }
+        try await waitUntil(timeout: 8) { f.store.alertMessage != nil }
         #expect(f.service.applyCount == 1)
         #expect(f.driver.value.fans[0].mode == .automatic)
         f.reader.stale = false
         f.store.suspend(); f.store.resume()
         try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
         #expect(f.service.session.status.policies == [f.policy])
+    }
+
+    @Test func wakeRetriesPreflightRejectionWithoutDisconnectingOrReapplyingSuccessfulPolicy() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        let preset = FanPreset(name: "CPU 50–65", model: "test", source: .live, policies: [f.policy])
+        f.store.presets = [preset]
+        try await f.store.apply([f.policy], presetID: preset.id)
+        f.driver.staleControlReads = 1
+        f.store.suspend(); f.store.resume()
+        try await waitUntil { f.service.applyCount == 3 && !f.store.controlPending }
+        #expect(f.service.disconnects == 0)
+        #expect(f.store.alertMessage == nil && !f.store.recoveryUnconfirmed)
+        #expect(f.store.activePresetName == preset.name)
+        #expect(f.service.session.status.policies == [f.policy])
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
+        #expect(f.service.applyCount == 3)
+    }
+
+    @Test func persistentServiceReadFailureStopsAfterThreePreflightAttempts() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.driver.staleControlReads = 100
+        f.store.suspend(); f.store.resume()
+        try await waitUntil(timeout: 8) { f.store.alertMessage != nil }
+        #expect(f.service.applyCount == 4, "原策略一次，唤醒后写入前校验最多三次")
+        #expect(f.driver.value.fans[0].mode == .automatic)
+        #expect(f.service.session.status.policies.isEmpty)
+        #expect(f.service.disconnects == 0)
+        let samples = f.reader.samples
+        try await waitUntil { f.reader.samples > samples }
+        #expect(f.service.applyCount == 4)
+    }
+
+    @Test func repeatedHeartbeatDoesNotExhaustWakeReadinessOnTheSameStaleSample() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.reader.stale = true
+        f.store.suspend(); f.store.resume()
+        try await waitUntil { f.reader.samples >= 1 }
+        f.reader.holdSample = true
+        try await waitUntil(timeout: 8) { f.service.requests.filter { $0 == .status }.count >= 3 }
+        #expect(f.store.alertMessage == nil)
+        #expect(f.service.applyCount == 1)
+        #expect(f.driver.value.fans[0].mode == .automatic)
     }
 
     @Test func failedWakeApplyIsNotRepeatedByPolling() async throws {

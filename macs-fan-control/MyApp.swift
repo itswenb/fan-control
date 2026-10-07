@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import SwiftUI
 
 @main
@@ -78,13 +79,16 @@ struct MenuBarStatusLabel: View {
 enum MenuBarStatusArtwork {
     private static var cached: (lines: [String], showIcon: Bool, image: NSImage)?
     private static let fanSymbol = NSImage(systemSymbolName: "fan.fill", accessibilityDescription: nil)?
-        .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))?
+        .cgImage(forProposedRect: nil, context: nil, hints: nil)
 
     static func make(lines: [String], showIcon: Bool) -> NSImage {
         if let cached, cached.lines == lines, cached.showIcon == showIcon { return cached.image }
         let font = NSFont.monospacedDigitSystemFont(ofSize: lines.count == 2 ? 9 : 12, weight: .medium)
-        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
-        let widths = lines.map { ceil(($0 as NSString).size(withAttributes: attributes).width) }
+        let attributes: [NSAttributedString.Key: Any] = [.font: font,
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1)]
+        let textLines = lines.map { CTLineCreateWithAttributedString(NSAttributedString(string: $0, attributes: attributes)) }
+        let widths = textLines.map { ceil(CTLineGetTypographicBounds($0, nil, nil, nil)) }
         let textWidth = widths.max() ?? 0
         let textX: CGFloat = showIcon ? 20 : 2
         let size = NSSize(width: textX + textWidth + 2, height: 22)
@@ -93,24 +97,20 @@ enum MenuBarStatusArtwork {
         guard let bitmap = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            return fanSymbol ?? NSImage(size: size)
+            return NSImage(size: size)
         }
         bitmap.scaleBy(x: scale, y: scale)
-        bitmap.translateBy(x: 0, y: size.height)
-        bitmap.scaleBy(x: 1, y: -1)
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap, flipped: true)
-        if showIcon {
-            fanSymbol?.draw(in: NSRect(x: 2, y: 4, width: 14, height: 14), from: .zero,
-                            operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        // 直接绘制到独立 CGContext，不切换 AppKit 当前上下文或翻转其坐标系。
+        if showIcon, let fanSymbol {
+            bitmap.draw(fanSymbol, in: CGRect(x: 2, y: 4, width: 14, height: 14))
         }
-        for (index, line) in lines.enumerated() {
+        for (index, line) in textLines.enumerated() {
             let x = textX + (textWidth - widths[index]) / 2
-            let y: CGFloat = lines.count == 2 ? (index == 0 ? 0 : 11) : 3
-            (line as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: attributes)
+            let top: CGFloat = lines.count == 2 ? (index == 0 ? 0 : 11) : 3
+            bitmap.textPosition = CGPoint(x: x, y: size.height - top - font.ascender)
+            CTLineDraw(line, bitmap)
         }
-        NSGraphicsContext.restoreGraphicsState()
-        guard let raster = bitmap.makeImage() else { return fanSymbol ?? NSImage(size: size) }
+        guard let raster = bitmap.makeImage() else { return NSImage(size: size) }
         let image = NSImage(cgImage: raster, size: size)
         image.isTemplate = true
         cached = (lines, showIcon, image)
