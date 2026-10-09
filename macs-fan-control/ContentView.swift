@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
     @Environment(AppStore.self) private var store
     @State private var editingFan: FanReading?
+    @State private var fanRenderGeneration = 0
 
     // 同一视图同一时刻只能呈现一个 sheet。把原先分散的多个 .sheet 布尔状态
     // 收敛成一个枚举,按优先级选出唯一要呈现的 sheet,从结构上杜绝“同时呈现两个”。
@@ -57,6 +59,7 @@ struct ContentView: View {
             GeometryReader { geometry in
                 HStack(spacing: 12) {
                     FanTable(editingFan: $editingFan)
+                        .id(fanRenderGeneration)
                         .frame(width: max(480, geometry.size.width * 0.58))
                         .dataPanel()
                     SensorsView()
@@ -83,6 +86,10 @@ struct ContentView: View {
         .alert(store.text("操作未完成", "Unable to complete"), isPresented: Binding(get: { store.alertMessage != nil }, set: { if !$0 { store.alertMessage = nil } })) {
             Button(store.text("知道了", "OK")) { store.alertMessage = nil }
         } message: { Text(store.alertMessage ?? "") }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            // 唤醒时清除风扇区域的静态绘制缓存，编辑状态和控制策略保留在外层。
+            fanRenderGeneration &+= 1
+        }
         .task { store.start() }
     }
 
@@ -164,9 +171,9 @@ private struct FanTable: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(store.text("风扇", "Fan")).frame(maxWidth: .infinity, alignment: .leading)
-                Text(store.text("最低 / 当前 / 最高", "Min / Current / Max")).frame(width: 180)
-                Text(store.text("控制策略", "Control")).frame(width: 150)
+                Text(store.text("风扇", "Fan")).fanTextDrawing().frame(maxWidth: .infinity, alignment: .leading)
+                Text(store.text("最低 / 当前 / 最高", "Min / Current / Max")).fanTextDrawing().frame(width: 180)
+                Text(store.text("控制策略", "Control")).fanTextDrawing().frame(width: 150)
             }.font(.caption.weight(.medium)).foregroundStyle(.secondary).padding(.horizontal, 16).frame(height: 38)
             Divider()
             if store.isLoading && store.hardwareOverview == nil {
@@ -178,7 +185,7 @@ private struct FanTable: View {
                 ForEach(Array(store.fanCatalog.enumerated()), id: \.element.id) { index, fan in
                     HStack(spacing: 8) {
                         Image(systemName: "fan.fill").font(.title2).foregroundStyle(Color.accentColor).frame(width: 24)
-                        Text(store.fanName(fan)).font(.callout.weight(.medium)).lineLimit(1)
+                        Text(store.fanName(fan)).font(.callout.weight(.medium)).lineLimit(1).fanTextDrawing()
                             .frame(maxWidth: .infinity, alignment: .leading).help(fan.id)
                         HStack(spacing: 5) {
                             Text(store.formattedRPM(fan.minimum)).foregroundStyle(.secondary)
@@ -189,7 +196,7 @@ private struct FanTable: View {
                         }.font(.system(size: 12)).monospacedDigit().frame(width: 180)
                         Button { editingFan = store.snapshot?.fans.first { $0.id == fan.id } } label: {
                             HStack(spacing: 6) {
-                                FanControlLabel(fanID: fan.id).lineLimit(1)
+                                FanControlLabel(fanID: fan.id).lineLimit(1).fanTextDrawing()
                                 Spacer(minLength: 0)
                                 Image(systemName: "slider.horizontal.3").font(.caption)
                             }.foregroundStyle(Color.primary)
@@ -215,8 +222,24 @@ private struct FanTable: View {
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
             }
         }.frame(maxHeight: .infinity)
+        #if DEBUG
+        .onAppear { UIInspection.recordFanPanelAppearance() }
+        #endif
     }
 
+}
+
+// macOS 26+ 的 SwiftUI 静态文字可能倒置；只对受影响的文字使用独立绘制。
+// 同类处理：https://github.com/p0deje/Maccy/issues/1113
+private extension View {
+    @ViewBuilder
+    func fanTextDrawing() -> some View {
+        if #available(macOS 26.0, *) {
+            drawingGroup()
+        } else {
+            self
+        }
+    }
 }
 
 private struct FanCurrentSpeed: View {

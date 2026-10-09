@@ -10,6 +10,11 @@ struct UIInspection: View {
     @Environment(\.openSettings) private var openSettings
     static var isRequested: Bool { ProcessInfo.processInfo.arguments.contains("--inspect-ui") }
     private static var started = false
+    private static var fanPanelAppearances = 0
+
+    static func recordFanPanelAppearance() {
+        if isRequested { fanPanelAppearances += 1 }
+    }
     private static var cleanup: (() -> Void)?
     private let isMenu: Bool
 
@@ -39,10 +44,9 @@ struct UIInspection: View {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-        let store = AppStore(defaults: defaults,
-                             storageDirectory: directory,
-                             helper: InspectionService())
-        store.policies = [FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)]
+        let helper = InspectionService()
+        let store = AppStore(defaults: defaults, storageDirectory: directory, helper: helper)
+        store.policies = helper.policies
         return store
     }
 
@@ -88,10 +92,67 @@ struct UIInspection: View {
                 openWindow(id: "main")
                 try await Task.sleep(for: .seconds(5))
                 let main = try requireWindow()
+                main.collectionBehavior.insert(.moveToActiveSpace)
                 main.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 try await Task.sleep(for: .seconds(3))
                 result["mainVisible"] = main.occlusionState.contains(.visible)
+                if ProcessInfo.processInfo.arguments.contains("--inspect-render-stress") {
+                    var current = main
+                    var completed = 0
+                    for cycle in 0..<36 {
+                        NSApp.appearance = NSAppearance(named: cycle.isMultiple(of: 2) ? .aqua : .darkAqua)
+                        current.appearance = NSApp.appearance
+                        AppLifecycle.store?.settings.language = cycle.isMultiple(of: 3) ? .chinese : .english
+                        current.setContentSize(NSSize(width: cycle.isMultiple(of: 2) ? 900 : 860,
+                                                      height: cycle.isMultiple(of: 2) ? 560 : 480))
+                        if cycle.isMultiple(of: 3) {
+                            current.performMiniaturize(nil)
+                            try await Task.sleep(for: .milliseconds(150))
+                            current.deminiaturize(nil)
+                        } else {
+                            current.orderOut(nil)
+                            try await Task.sleep(for: .milliseconds(150))
+                            current.makeKeyAndOrderFront(nil)
+                        }
+                        if cycle.isMultiple(of: 6) {
+                            current.close()
+                            AppWindowVisibility.prepareToOpen()
+                            openWindow(id: "main")
+                            try await Task.sleep(for: .milliseconds(300))
+                            current = try requireWindow()
+                            current.collectionBehavior.insert(.moveToActiveSpace)
+                        }
+                        NSApp.activate(ignoringOtherApps: true)
+                        try await Task.sleep(for: .milliseconds(500))
+                        guard current.isVisible, !current.isMiniaturized else { throw CocoaError(.validationMissingMandatoryProperty) }
+                        let appearances = Self.fanPanelAppearances
+                        let policies = AppLifecycle.store?.policies
+                        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+                        try await Task.sleep(for: .milliseconds(300))
+                        guard Self.fanPanelAppearances == appearances + 1,
+                              AppLifecycle.store?.policies == policies,
+                              AppLifecycle.store?.alertMessage == nil else { throw CocoaError(.validationMissingMandatoryProperty) }
+                        completed += 1
+                        result["renderCycles"] = completed
+                        result["renderWindow"] = current.windowNumber
+                        save()
+                        if completed.isMultiple(of: 12) { try await Task.sleep(for: .seconds(2)) }
+                    }
+                    AppLifecycle.store?.settings.language = .english
+                    NSApp.appearance = NSAppearance(named: .aqua)
+                    current.appearance = NSApp.appearance
+                    current.setContentSize(NSSize(width: 900, height: 560))
+                    try await Task.sleep(for: .seconds(1))
+                    result["wakeRebuilds"] = completed
+                    result["renderStressPassed"] = true
+                    save()
+                    try await Task.sleep(for: .seconds(15))
+                    AppLifecycle.store?.stop()
+                    Self.cleanup?()
+                    NSApp.terminate(nil)
+                    return
+                }
                 if profileCPU { result["openCPU"] = try await measureCPU() }
                 save()
                 openSettings()
@@ -190,13 +251,16 @@ private final class InspectionService: ControlServiceConnection {
     let bundled = true, signed = true, installed = true
     var onDisconnect: (() -> Void)?
     private let owner = UUID()
+    let policies: [FanPolicy] = ProcessInfo.processInfo.arguments.contains("--inspect-render-stress")
+        ? ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: SensorCatalog.cpuAverageKey, low: 50, high: 65) }
+        : [FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)]
     func register() async throws { throw ControlError.readOnly }
     func unregister(connectionFailed: Bool) async throws { throw ControlError.readOnly }
     func disconnect() {}
     func request(_ request: HelperRequest) async throws -> HelperReply {
         guard request.operation == .status || request.operation == .heartbeat else { throw ControlError.readOnly }
         var reply = HelperReply(available: true, status: SessionStatus(owner: owner,
-            policies: [FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], pendingRecovery: [], message: nil))
+            policies: policies, pendingRecovery: [], message: nil))
         reply.ownsSession = true
         return reply
     }
