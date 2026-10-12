@@ -160,7 +160,10 @@ public final class ControlSession {
     }
 
     public func disconnected(client: UUID) {
-        if owner == client { recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected) }
+        // 保留正在处理的故障与恢复预算；Preserve the current recovery cause and retry budget.
+        if owner == client, pending.isEmpty, !journalFailure {
+            recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected)
+        }
         if removalOwner == client { removalOwner = nil }
     }
 

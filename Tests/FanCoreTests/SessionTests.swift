@@ -190,6 +190,25 @@ struct SessionTests {
         #expect(session.status.recoveryReason == .controlFailure)
     }
 
+    @Test(arguments: [true, false])
+    func disconnectDuringSafetyRecoveryPreservesOriginalReason(thermal: Bool) throws {
+        let now = Date(), driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+        let session = try ControlSession(driver: driver, journal: journal)
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)], client: client, uptime: 10, now: now)
+        driver.failRestore = "F0"
+        if !thermal { driver.value.fans[0].target = 4_000 }
+        session.tick(uptime: 11, now: now, thermalEmergency: thermal)
+        #expect(session.status.recoveryBlocked)
+        session.disconnected(client: client)
+        #expect(session.status.recoveryReason == (thermal ? .thermalEmergency : .controlFailure))
+        #expect(driver.restores == ["F0"])
+        driver.failRestore = nil
+        session.tick(uptime: 12, now: now)
+        #expect(!session.status.recoveryBlocked && session.status.owner == nil)
+        #expect(session.status.recoveryReason?.permitsAutomaticResume == false)
+        #expect(journal.fans.isEmpty)
+    }
+
     @Test func sameTargetIsWrittenAgainAfterExplicitAutomatic() throws {
         let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
         let session = try ControlSession(driver: driver, journal: MemoryJournal())

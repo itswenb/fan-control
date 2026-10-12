@@ -14,6 +14,7 @@ private final class MemoryDriver: FanControlDriver {
     var value: HardwareSnapshot
     var restores = 0
     var staleControlReads = 0
+    var failRestore = false
 
     init() {
         let now = Date()
@@ -34,7 +35,10 @@ private final class MemoryDriver: FanControlDriver {
         return value
     }
     func setTarget(fanID: String, rpm: Double) throws { value.fans[0].mode = .fixed; value.fans[0].target = rpm }
-    func restoreAutomatic(fanID: String) throws { restores += 1; value.fans[0].mode = .automatic }
+    func restoreAutomatic(fanID: String) throws {
+        if failRestore { throw ControlError.invalidConfiguration }
+        restores += 1; value.fans[0].mode = .automatic
+    }
 }
 
 @MainActor
@@ -83,9 +87,15 @@ private final class MemoryService: ControlServiceConnection {
     let client = UUID()
     var requests: [HelperRequest.Operation] = []
     var holdRestore = false
+    var holdStatus = false
     var failApply = false
+    var timeoutsBeforeApply = 0
+    var timeoutsAfterApply = 0
+    var onApplyTimeout: (() -> Void)?
+    var transportError = HelperClientError.timeout
     var disconnects = 0
     var restoreContinuation: CheckedContinuation<Void, Never>?
+    var statusContinuation: CheckedContinuation<Void, Never>?
     var applyCount: Int { requests.filter { $0 == .apply }.count }
 
     init(driver: MemoryDriver) throws { session = try ControlSession(driver: driver, journal: MemoryJournal()) }
@@ -98,14 +108,26 @@ private final class MemoryService: ControlServiceConnection {
         switch request.operation {
         case .apply:
             if failApply { throw ControlError.invalidRPM }
+            if timeoutsBeforeApply > 0 {
+                timeoutsBeforeApply -= 1
+                onApplyTimeout?()
+                throw transportError
+            }
             do {
                 try session.apply(request.policies, temperatureSources: request.temperatureSources,
                                   client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
             } catch SessionError.readingsNotReady { throw HelperClientError.readingsNotReady }
+            if timeoutsAfterApply > 0 {
+                timeoutsAfterApply -= 1
+                onApplyTimeout?()
+                throw transportError
+            }
         case .restore:
             if holdRestore { await withCheckedContinuation { restoreContinuation = $0 } }
             try session.release(client: client)
         case .heartbeat: session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
+        case .status:
+            if holdStatus { await withCheckedContinuation { statusContinuation = $0 } }
         default: break
         }
         var reply = HelperReply(available: true, status: session.status)
@@ -137,8 +159,10 @@ private final class Fixture {
 
     func close() {
         store.stop()
+        service.onApplyTimeout = nil
         reader.sampleContinuation?.resume(); reader.sampleContinuation = nil
         service.restoreContinuation?.resume(); service.restoreContinuation = nil
+        service.statusContinuation?.resume(); service.statusContinuation = nil
         defaults.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: directory)
     }
@@ -572,5 +596,128 @@ struct LifecycleTests {
         #expect(f.service.applyCount == 2)
         #expect(f.driver.value.fans[0].mode == .automatic)
         #expect(f.store.displayPolicies.isEmpty)
+    }
+
+    @Test(arguments: [false, true], [HelperClientError.timeout, .disconnected])
+    func wakeTransportTimeoutResumesOnlyAfterStatusConfirmation(appliedBeforeTimeout: Bool, failure: HelperClientError) async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        let preset = FanPreset(name: "CPU 45–65", model: "test", source: .live, policies: [f.policy])
+        f.store.presets = [preset]
+        try await f.store.apply([f.policy], presetID: preset.id)
+        f.service.transportError = failure
+        if appliedBeforeTimeout { f.service.timeoutsAfterApply = 1 }
+        else { f.service.timeoutsBeforeApply = 1 }
+        f.store.suspend(); f.store.resume()
+        try await waitUntil(timeout: 8) { f.service.applyCount == 3 && !f.store.controlPending }
+        let applies = f.service.requests.indices.filter { f.service.requests[$0] == .apply }
+        #expect(f.service.requests[(applies[1] + 1)..<applies[2]].contains(.status))
+        #expect(f.service.disconnects == 1)
+        #expect(f.driver.restores == (appliedBeforeTimeout ? 2 : 1))
+        #expect(f.store.alertMessage == nil && !f.store.recoveryUnconfirmed)
+        #expect(f.store.activePresetName == preset.name)
+        #expect(f.store.displayPolicies == [f.policy])
+        #expect(f.service.session.status.policies == [f.policy])
+        try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
+        #expect(f.service.applyCount == 3)
+    }
+
+    @Test func wakeTransportTimeoutStopsAfterThreeAttempts() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.timeoutsBeforeApply = 100
+        f.store.suspend(); f.store.resume()
+        try await waitUntil(timeout: 10) { f.store.alertMessage != nil && !f.store.recoveryUnconfirmed }
+        #expect(f.service.applyCount == 4)
+        #expect(f.store.displayPolicies.isEmpty)
+        let samples = f.reader.samples
+        try await waitUntil { f.reader.samples > samples }
+        #expect(f.service.applyCount == 4)
+    }
+
+    @Test func wakeTimeoutWaitsForPendingHardwareRecovery() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.timeoutsAfterApply = 1
+        f.service.onApplyTimeout = { f.driver.failRestore = true }
+        f.store.suspend(); f.store.resume()
+        try await waitUntil { f.service.session.status.recoveryBlocked }
+        let checks = f.service.requests.filter { $0 == .status }.count
+        try await waitUntil { f.service.requests.filter { $0 == .status }.count > checks }
+        #expect(f.service.applyCount == 2)
+        #expect(f.store.recoveryUnconfirmed)
+        f.driver.failRestore = false
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+        try await waitUntil(timeout: 8) { f.service.applyCount == 3 && !f.store.controlPending }
+        #expect(!f.store.recoveryUnconfirmed)
+        #expect(f.store.displayPolicies == [f.policy])
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func wakeTimeoutDoesNotRetryConfirmedSafetyRecovery(thermalEmergency: Bool, blockedRecovery: Bool) async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.timeoutsAfterApply = 1
+        f.service.onApplyTimeout = {
+            f.driver.failRestore = blockedRecovery
+            if !thermalEmergency { f.driver.value.sensors[0].celsius = nil }
+            f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: thermalEmergency)
+            f.driver.value.sensors[0].celsius = 55
+        }
+        f.store.suspend(); f.store.resume()
+        if blockedRecovery {
+            try await waitUntil { f.service.disconnects == 1 }
+            #expect(f.service.session.status.recoveryBlocked)
+            f.driver.failRestore = false
+            f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+        }
+        try await waitUntil(timeout: 8) { f.service.applyCount == 2 && !f.store.recoveryUnconfirmed && f.store.alertMessage != nil }
+        let samples = f.reader.samples
+        try await waitUntil { f.reader.samples > samples }
+        #expect(f.service.applyCount == 2)
+        #expect(f.store.displayPolicies.isEmpty)
+        #expect(f.service.session.status.recoveryReason == (thermalEmergency ? .thermalEmergency : .controlFailure))
+    }
+
+    @Test func explicitAutomaticCancelsPendingTransportResume() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.service.timeoutsBeforeApply = 1
+        f.service.onApplyTimeout = { f.service.holdStatus = true }
+        f.store.suspend(); f.store.resume()
+        try await waitUntil { f.service.statusContinuation != nil }
+        f.store.restoreAutomatic()
+        try await waitUntil { !f.store.controlPending && !f.store.recoveryUnconfirmed }
+        f.service.holdStatus = false
+        f.service.statusContinuation?.resume(); f.service.statusContinuation = nil
+        try await waitUntil { f.reader.samples >= 3 }
+        #expect(f.service.applyCount == 2)
+        #expect(f.store.displayPolicies.isEmpty)
+        #expect(f.driver.value.fans[0].mode == .automatic)
+    }
+
+    @Test func wakeTimeoutDoesNotTakeOverAnotherConnection() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        let other = UUID()
+        let externalPolicy = FanPolicy(fanID: "F0", mode: .fixed, rpm: 4_500)
+        f.service.timeoutsBeforeApply = 1
+        f.service.onApplyTimeout = {
+            do {
+                try f.service.session.apply([externalPolicy], client: other,
+                                            uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+            } catch { Issue.record(error) }
+        }
+        f.store.suspend(); f.store.resume()
+        try await waitUntil { f.service.requests.filter { $0 == .status }.count >= 3 }
+        #expect(f.service.applyCount == 2)
+        #expect(f.service.session.status.owner == other)
+        #expect(f.service.session.status.policies == [externalPolicy])
+        #expect(f.store.recoveryUnconfirmed)
     }
 }

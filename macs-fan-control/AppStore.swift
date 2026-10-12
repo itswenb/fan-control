@@ -700,6 +700,15 @@ final class AppStore {
             helperMessage = reply.available ? text("控制服务已连接", "Control service connected") : (status.message ?? text("控制暂不可用：未检测到可用的调速接口，或另一连接正在使用服务。", "Control unavailable: no compatible fan control interface or another active connection."))
             if displayPolicies != status.policies { displayPolicies = status.policies }
             if !recoveryUnconfirmed {
+                // 服务确认安全故障时终止恢复；Never retry a confirmed safety failure.
+                if startupRestorePending, startupRestoreAttempts > 0,
+                   status.recoveryReason == .controlFailure || status.recoveryReason == .thermalEmergency {
+                    startupRestorePending = false
+                    let message = text("上次策略未自动恢复：", "Last policy was not resumed: ")
+                        + (status.message ?? SessionError.recoveryRequired.localizedDescription)
+                    alertMessage = message
+                    record(message, error: true)
+                }
                 let wasControlling = hasCustomControl
                 if wasControlling, !reply.ownsSession, status.owner == nil,
                    status.recoveryReason?.permitsAutomaticResume == true {
@@ -829,7 +838,7 @@ final class AppStore {
             }
             return
         }
-        // 一旦实际写入失败就停止；只有服务明确确认尚未写入时才等待下个新样本。
+        // 写入失败时停止，传输结果未知时先查询状态；Reconcile unknown transport outcomes before retrying.
         startupRestorePending = false
         let selection = PresetSelection.resolve(policies: lastControl.policies, in: snapshot, presets: presets,
                                                 preferredID: lastControl.presetID, preferFullSpeed: lastControl.fullSpeed)
@@ -838,12 +847,18 @@ final class AppStore {
             try await apply(lastControl.policies, presetID: id, builtIn: selection == .fullSpeed ? "full" : "custom")
             record(text("已恢复上次使用的策略。", "Resumed the last selected policy."))
         } catch {
-            if let error = error as? HelperClientError, case .readingsNotReady = error {
-                startupRestoreAttempts += 1
-                if startupRestoreAttempts < 3 {
-                    // 服务明确确认没有写入；等待下一份新样本，不重连或反复应用已生效策略。
-                    startupRestorePending = true
-                    return
+            if let clientError = error as? HelperClientError {
+                switch clientError {
+                case .readingsNotReady, .timeout, .disconnected:
+                    startupRestoreAttempts += 1
+                    if startupRestoreAttempts < 3 {
+                        // 未确认的写入必须等状态查询解除恢复阻塞；Wait for confirmed recovery before retrying.
+                        startupRestorePending = true
+                        if case .readingsNotReady = clientError { return }
+                        record(text("恢复请求未确认，等待控制服务确认系统自动后重试。", "Resume request unconfirmed. Waiting for confirmed automatic mode before retrying."))
+                        return
+                    }
+                case .remote: break
                 }
             }
             let message = text("上次策略恢复失败：", "Unable to resume the last policy: ") + error.localizedDescription
