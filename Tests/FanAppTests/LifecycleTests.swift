@@ -95,7 +95,14 @@ private final class MemoryService: ControlServiceConnection {
     var transportError = HelperClientError.timeout
     var disconnects = 0
     var restoreContinuation: CheckedContinuation<Void, Never>?
-    var statusContinuation: CheckedContinuation<Void, Never>?
+    private var statusContinuations: [CheckedContinuation<Void, Never>] = []
+    var statusContinuation: CheckedContinuation<Void, Never>? {
+        get { statusContinuations.last }
+        set {
+            if let newValue { statusContinuations.append(newValue) }
+            else if !statusContinuations.isEmpty { statusContinuations.removeLast() }
+        }
+    }
     var applyCount: Int { requests.filter { $0 == .apply }.count }
 
     init(driver: MemoryDriver) throws { session = try ControlSession(driver: driver, journal: MemoryJournal()) }
@@ -162,7 +169,9 @@ private final class Fixture {
         service.onApplyTimeout = nil
         reader.sampleContinuation?.resume(); reader.sampleContinuation = nil
         service.restoreContinuation?.resume(); service.restoreContinuation = nil
-        service.statusContinuation?.resume(); service.statusContinuation = nil
+        while let continuation = service.statusContinuation {
+            continuation.resume(); service.statusContinuation = nil
+        }
         defaults.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: directory)
     }
@@ -218,7 +227,8 @@ struct LifecycleTests {
         #expect(f.store.fanCatalog.first?.maximum == 6_200)
         value.fans[0].controlSupported = false
         f.store.snapshot = value
-        #expect(!f.store.canRegisterHelper)
+        // 无风扇控制能力仍可安装防休眠服务。 / Sleep control does not require a fan interface.
+        #expect(f.store.canRegisterHelper)
         #expect(f.store.fanCatalog.first?.controlSupported == false)
         value.sensors.removeFirst()
         value.fans.removeAll()

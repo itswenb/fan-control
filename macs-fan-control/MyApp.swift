@@ -11,7 +11,7 @@ struct MyApp: App {
     init() {
         #if DEBUG
         let store = UIInspection.isRequested ? UIInspection.makeStore() : AppStore()
-        _updater = StateObject(wrappedValue: AppUpdater(startingUpdater: !UIInspection.isRequested))
+        _updater = StateObject(wrappedValue: AppUpdater(startingUpdater: !UIInspection.isRequested && !ProcessInfo.processInfo.arguments.contains("--capture-preview")))
         #else
         let store = AppStore()
         #endif
@@ -148,18 +148,18 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         #endif
         if terminationApproved { return .terminateNow }
         guard let store = Self.store,
-              store.hasCustomControl || store.recoveryUnconfirmed || store.controlPending else { return .terminateNow }
+              store.hasCustomControl || store.recoveryUnconfirmed || store.controlPending || store.sleepControl.needsRelease else { return .terminateNow }
         guard !terminating else { return .terminateCancel }
         terminating = true
         Task {
             do {
-                try await store.restoreHardware()
+                try await store.restoreForTermination()
                 terminationApproved = true
                 sender.terminate(nil)
             } catch {
                 sender.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
-                alert.messageText = store.text("恢复系统自动尚未确认", "Automatic mode has not been confirmed")
+                alert.messageText = store.text("系统设置恢复尚未确认", "System settings recovery has not been confirmed")
                 alert.informativeText = error.localizedDescription
                 alert.addButton(withTitle: store.text("留在应用中重试", "Stay and retry"))
                 alert.addButton(withTitle: store.text("仍然退出", "Quit anyway"))

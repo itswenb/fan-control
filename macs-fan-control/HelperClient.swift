@@ -17,6 +17,7 @@ protocol ControlServiceConnection: AnyObject {
 
 @MainActor
 final class HelperClient: ControlServiceConnection {
+    var diagnostics: SleepDiagnosticLog?
     private var connection: NSXPCConnection?
     private var connectionID: UUID?
     private var pending: [UUID: CheckedContinuation<HelperReply, any Error>] = [:]
@@ -62,6 +63,7 @@ final class HelperClient: ControlServiceConnection {
     }
 
     private func installation(operation: String) async throws {
+        diagnostics?.event("xpc", "installation.begin", "operation=\(operation)")
         let app = Bundle.main.bundleURL
         let client = try CodeIdentity.read(at: app, identifier: HelperConstants.appIdentifier)
         try client.validateRunningProcess()
@@ -80,19 +82,25 @@ final class HelperClient: ControlServiceConnection {
         /usr/bin/codesign \(helperVerification) "$fan_stage/FanControl.app/Contents/Library/HelperTools/FanControlHelper"
         "$fan_stage/FanControl.app/Contents/Library/HelperTools/FanControlHelper" \(quoted(operation)) "$fan_stage/FanControl.app" \(quoted(client.hash)) \(quoted(helper.hash))
         """
-        try await Task.detached {
-            let process = Process(), output = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", "on run argv\n do shell script (item 1 of argv) with administrator privileges\nend run", command]
-            process.standardOutput = output
-            process.standardError = output
-            try process.run()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                throw HelperClientError.remote(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-        }.value
+        do {
+            try await Task.detached {
+                let process = Process(), output = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", "on run argv\n do shell script (item 1 of argv) with administrator privileges\nend run", command]
+                process.standardOutput = output
+                process.standardError = output
+                try process.run()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    throw HelperClientError.remote(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }.value
+            diagnostics?.event("xpc", "installation.confirmed", "operation=\(operation)")
+        } catch {
+            diagnostics?.event("xpc", "installation.failed", "operation=\(operation) \(SleepDiagnosticLog.describe(error))", error: true)
+            throw error
+        }
     }
 
     func request(_ request: HelperRequest) async throws -> HelperReply {
@@ -105,6 +113,7 @@ final class HelperClient: ControlServiceConnection {
             timeouts[id] = Task { [weak self] in
                 do { try await Task.sleep(for: .seconds(5)) } catch { return }
                 guard self?.pending[id] != nil else { return }
+                self?.diagnostics?.event("xpc", "request.timeout", "operation=\(request.operation.rawValue) connection=\(connectionID)", error: true)
                 self?.lostConnection(id: connectionID, error: HelperClientError.timeout)
             }
             // XPC 在自己的连接队列同步回调，闭包必须非隔离，否则 @MainActor 推断会在
@@ -119,13 +128,17 @@ final class HelperClient: ControlServiceConnection {
                     do {
                         guard response.count <= 65_536 else { throw ControlError.invalidConfiguration }
                         let value = try JSONDecoder().decode(HelperReply.self, from: response)
-                        guard value.version == HelperConstants.protocolVersion else { throw ControlError.invalidConfiguration }
+                        guard value.version == HelperConstants.protocolVersion else {
+                            self.diagnostics?.event("xpc", "protocol.mismatch", "received=\(value.version) expected=\(HelperConstants.protocolVersion)", error: true)
+                            throw ControlError.invalidConfiguration
+                        }
                         self.finish(id, result: .success(value))
                     } catch { self.lostConnection(id: connectionID, error: error) }
                 }
             }
         }
         if let error = response.error {
+            if request.operation.isSleepOperation { diagnostics?.event("xpc", "remote.error", "operation=\(request.operation.rawValue) message=\(error)", error: true) }
             if request.operation == .apply, response.readingsNotReady == true { throw HelperClientError.readingsNotReady }
             throw HelperClientError.remote(error)
         }
@@ -135,7 +148,9 @@ final class HelperClient: ControlServiceConnection {
     private func connect() throws -> NSXPCConnection {
         if let connection { return connection }
         guard bundled, installed else { throw ControlError.readOnly }
-        let requirement = try CodeIdentity.read(at: helperURL, identifier: HelperConstants.machService).requirement
+        let identity = try CodeIdentity.read(at: helperURL, identifier: HelperConstants.machService)
+        diagnostics?.event("xpc", "connect", "expectedHelperHash=\(identity.hash)")
+        let requirement = identity.requirement
         let connection = NSXPCConnection(machServiceName: HelperConstants.machService, options: .privileged)
         let id = UUID()
         connection.remoteObjectInterface = NSXPCInterface(with: FanHelperProtocol.self)
@@ -156,6 +171,7 @@ final class HelperClient: ControlServiceConnection {
 
     private func lostConnection(id: UUID? = nil, error: any Error = HelperClientError.disconnected) {
         if let id, id != connectionID { return }
+        diagnostics?.event("xpc", "connection.closed", "pending=\(pending.count) \(SleepDiagnosticLog.describe(error))", error: !pending.isEmpty)
         let previous = connection
         connection = nil
         connectionID = nil

@@ -39,7 +39,10 @@ enum DebugPreview {
                 try await capture(PresetsView().environment(store), name: "presets", size: NSSize(width: 690, height: 470), appearance: .aqua, directory: directory)
                 try await capture(SettingsView().environment(store), name: "settings", size: NSSize(width: 510, height: 660), appearance: .aqua, directory: directory)
                 store.snapshot = try await reader.sample(); store.now = Date()
-                try await capture(MenuBarView().environment(store), name: "menu", size: NSSize(width: 340, height: 340), appearance: .aqua, directory: directory)
+                try await capture(MenuBarView().environment(store), name: "menu", size: NSSize(width: 340, height: 480), appearance: .aqua, directory: directory)
+                store.settings.language = .chinese
+                try await capture(MenuBarView().environment(store), name: "menu-zh", size: NSSize(width: 340, height: 480), appearance: .darkAqua, directory: directory)
+                store.settings.language = .english
                 let legacyIcon = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"menuDisplay":"icon","sensorID":"Tp01"}"#.utf8))
                 guard legacyIcon.menuDisplay == .none, legacyIcon.showMenuIcon, legacyIcon.sensorID == "Tp01" else { throw ControlError.invalidConfiguration }
                 store.settings.showMenuIcon = false
@@ -68,7 +71,7 @@ enum DebugPreview {
     }
 
     private static func capture<V: View>(_ view: V, name: String, size: NSSize, appearance: NSAppearance.Name, directory: URL) async throws {
-        let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
+        let host = NSHostingView(rootView: view.environmentObject(AppUpdater(startingUpdater: false)).background(Color(nsColor: .windowBackgroundColor)))
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.title = "Fan Control · Preview"

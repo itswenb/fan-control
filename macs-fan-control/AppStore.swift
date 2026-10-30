@@ -162,6 +162,7 @@ final class AppStore {
     var helperRegistered = false
     var helperInstalling = false
     var helperConnectionFailed = false
+    let sleepControl: SleepInhibitionController
     var settings: AppSettings {
         didSet {
             if let data = try? JSONEncoder().encode(settings) { defaults.set(data, forKey: "settings") }
@@ -195,12 +196,18 @@ final class AppStore {
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let helper: any ControlServiceConnection
+    @ObservationIgnored private let sleepLog: SleepDiagnosticLog
 
     init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil,
-         reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient()) {
+         reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient(),
+         sleepLights: (any LidBacklightManaging)? = nil) {
         self.defaults = defaults
         self.reader = reader
         self.helper = helper
+        let log = Bundle.main.bundleIdentifier == HelperConstants.appIdentifier ? SleepDiagnosticLog.application : SleepDiagnosticLog()
+        self.sleepLog = log
+        (helper as? HelperClient)?.diagnostics = log
+        self.sleepControl = SleepInhibitionController(helper: helper, lights: sleepLights ?? LidBacklightController(diagnostics: log), diagnostics: log)
         settings = defaults.data(forKey: "settings").flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) } ?? AppSettings()
         lastControl = defaults.data(forKey: "lastControlConfiguration").flatMap {
             try? JSONDecoder().decode(LastControlConfiguration.self, from: $0)
@@ -212,8 +219,10 @@ final class AppStore {
         catch { configurationError = error.localizedDescription }
         refreshLoginStatus()
         refreshHelperRegistration()
+        sleepControl.onChange = { [weak self] in self?.updateControlActivity() }
         helper.onDisconnect = { [weak self] in
             guard let self else { return }
+            self.sleepControl.disconnected()
             self.controlRevision += 1
             self.helperAvailable = false
             self.helperSessionKnown = false
@@ -229,7 +238,7 @@ final class AppStore {
     func text(_ chinese: String, _ english: String) -> String { self.english ? english : chinese }
     var canControl: Bool { helperAvailable && snapshot != nil && !isSuspended && connectionError == nil && !controlPending && !recoveryUnconfirmed }
     var canRegisterHelper: Bool {
-        helper.bundled && helper.signed && (hardwareOverview == nil || hardwareOverview?.canControlFans == true)
+        helper.bundled && helper.signed
     }
     var currentPresets: [FanPreset] { presets.filter { $0.source == .live && $0.model == hardwareOverview?.model } }
     var hasCustomControl: Bool { policies.contains { $0.mode != .automatic } }
@@ -318,6 +327,8 @@ final class AppStore {
         #endif
         guard !started else { return }
         started = true
+        sleepLog.event("app", "process.start", "version=\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown") protocol=\(HelperConstants.protocolVersion) OS=\(ProcessInfo.processInfo.operatingSystemVersionString) model=\(deviceIdentity)")
+        sleepControl.start()
         beginPolling()
     }
 
@@ -450,6 +461,8 @@ final class AppStore {
     func suspend() {
         guard !isSuspended else { return }
         isSuspended = true
+        sleepControl.stop()
+        Task { try? await sleepControl.release() }
         helperSessionKnown = false
         startupRestorePending = false
         pollingTask?.cancel(); helperPollingTask?.cancel(); generation += 1
@@ -467,6 +480,7 @@ final class AppStore {
     func resume() {
         guard isSuspended else { return }
         isSuspended = false
+        sleepControl.start()
         snapshot = nil
         startupRestorePending = true
         startupRestoreAttempts = 0
@@ -486,16 +500,17 @@ final class AppStore {
         pollingTask?.cancel(); helperPollingTask?.cancel(); generation += 1
         started = false
         startupRestorePending = false
+        sleepControl.stop()
         helper.disconnect()
         endControlActivity()
     }
 
     private func updateControlActivity() {
-        guard hasCustomControl, !isSuspended else { endControlActivity(); return }
+        guard hasCustomControl || sleepControl.needsRelease, !isSuspended else { endControlActivity(); return }
         if controlActivity == nil {
             // 维持用户主动选择的持续控制；仍允许熄屏、合盖和系统正常睡眠。
             controlActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
-                                                                   reason: "维持用户选择的风扇策略及控制服务心跳")
+                                                                   reason: "维持用户选择的风扇或防休眠会话心跳")
         }
     }
 
@@ -655,6 +670,9 @@ final class AppStore {
         Task {
             defer { helperInstalling = false }
             do {
+                try await sleepControl.release()
+                sleepControl.stop()
+                defer { sleepControl.start() }
                 try await helper.register()
                 refreshHelperRegistration()
                 await refreshHelperSession()
@@ -672,6 +690,9 @@ final class AppStore {
         Task {
             defer { helperInstalling = false }
             do {
+                try await sleepControl.release()
+                sleepControl.stop()
+                defer { sleepControl.start() }
                 if hasCustomControl || recoveryUnconfirmed { try await restoreHardware() }
                 try await helper.unregister(connectionFailed: helperConnectionFailed)
                 lastControl = nil
@@ -754,7 +775,7 @@ final class AppStore {
 
     private func automaticallyRepairHelper(after error: any Error) {
         guard !helperConnectedThisLaunch, helperRegistered, !helperInstalling,
-              !hasCustomControl, !recoveryUnconfirmed, canRegisterHelper,
+              !hasCustomControl, !recoveryUnconfirmed, !sleepControl.needsRelease, canRegisterHelper,
               let identity = helperBuildIdentity,
               defaults.string(forKey: "automaticHelperRepairAttemptedBuild") != identity else { return }
         if let clientError = error as? HelperClientError {
@@ -780,6 +801,35 @@ final class AppStore {
             if rememberSelection { rememberControl() }
             record(text("已确认恢复系统自动。", "Restored to automatic mode."))
         } catch { helper.disconnect(); recoveryUnconfirmed = true; throw error }
+    }
+
+    func setSleepInhibition(_ enabled: Bool) {
+        guard !helperInstalling, !sleepControl.pending else { return }
+        sleepActionError = nil
+        Task {
+            do {
+                if enabled, !helperRegistered || helperConnectionFailed {
+                    guard canRegisterHelper else { throw ControlError.readOnly }
+                    helperInstalling = true
+                    defer { helperInstalling = false }
+                    try await helper.register()
+                    refreshHelperRegistration()
+                    sleepControl.start()
+                }
+                try await sleepControl.setEnabled(enabled)
+            } catch {
+                record(error.localizedDescription, error: true)
+                // 菜单中直接显示错误，不要求打开主窗口。 / Keep menu-action errors in the menu.
+                sleepActionError = error.localizedDescription
+            }
+        }
+    }
+
+    var sleepActionError: String?
+
+    func restoreForTermination() async throws {
+        try await sleepControl.release()
+        if hasCustomControl || recoveryUnconfirmed || controlPending { try await restoreHardware() }
     }
 
     func setLoginEnabled(_ enabled: Bool) {
@@ -868,6 +918,7 @@ final class AppStore {
     }
 
     func record(_ message: String, error: Bool = false) {
+        sleepLog.event("app", "event", message, error: error)
         events.insert(DiagnosticEvent(message: message, isError: error), at: 0)
         if events.count > 100 { events.removeLast(events.count - 100) }
     }
@@ -888,6 +939,8 @@ final class AppStore {
         Hardware control: \(helperAvailable ? "available" : "unavailable")
         Helper: \(helperMessage)
         Recovery unconfirmed: \(recoveryUnconfirmed)
+        Helper protocol: \(HelperConstants.protocolVersion)
+        Expected code identities: \(helperBuildIdentity ?? "unavailable")
         Fans: \(snapshot?.fans.count ?? 0)
         Sensors: \(snapshot?.sensors.count ?? 0)
 
@@ -902,6 +955,10 @@ final class AppStore {
         panel.nameFieldStringValue = "FanControl-diagnostics.txt"
         panel.allowedContentTypes = [.plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        perform { try diagnosticReport.write(to: url, atomically: true, encoding: .utf8) }
+        Task {
+            let sleepDetails = await sleepControl.diagnosticDetails()
+            let report = diagnosticReport + "\n\n" + sleepDetails
+            perform { try report.write(to: url, atomically: true, encoding: .utf8) }
+        }
     }
 }

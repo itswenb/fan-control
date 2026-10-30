@@ -1,5 +1,6 @@
 import Foundation
 import FanCore
+import FanHardware
 import Darwin
 
 enum InstallationError: Error, LocalizedError {
@@ -8,7 +9,7 @@ enum InstallationError: Error, LocalizedError {
         switch self {
         case .existing: "已有控制服务。请先用安装该服务的应用恢复自动并移除服务，再安装新版本。"
         case .unsafePath: "服务目录的所有者或权限不符合要求，安装已停止。"
-        case .pendingRecovery: "风扇恢复尚未确认，暂时不能更新或移除服务。请用原版本应用恢复系统自动后重试。"
+        case .pendingRecovery: "风扇或睡眠设置恢复尚未确认，暂时不能更新或移除服务。请用原版本应用恢复后重试。"
         case .commandFailed: "系统未能完成服务注册。请查看系统后台项目权限。"
         case .rollbackFailed: "服务更新失败，旧服务也未能自动恢复。请保留原应用并检查控制服务状态。"
         }
@@ -94,6 +95,7 @@ enum LocalInstallation {
     }
 
     private static func requireEmptyRecovery() throws {
+        guard try !SleepRecoveryJournal().load() else { throw InstallationError.pendingRecovery }
         let path = HelperConstants.supportPath + "/recovery.json"
         var metadata = stat()
         if lstat(path, &metadata) != 0 {

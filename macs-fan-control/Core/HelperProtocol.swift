@@ -4,11 +4,12 @@ public enum HelperConstants {
     public static let machService = "com.itswenb.fancontrol.helper"
     public static let appIdentifier = "com.itswenb.fancontrol"
     public static let plistName = machService + ".plist"
-    public static let protocolVersion = 3
+    public static let protocolVersion = 4
     public static let installedHelperPath = "/Library/PrivilegedHelperTools/" + machService
     public static let daemonPath = "/Library/LaunchDaemons/" + plistName
     public static let supportPath = "/Library/Application Support/FanControl-helper"
     public static let trustPath = supportPath + "/trust.json"
+    public static let sleepRecoveryPath = supportPath + "/sleep-recovery.json"
 
 }
 
@@ -17,7 +18,17 @@ public enum HelperConstants {
 }
 
 public struct HelperRequest: Codable, Sendable {
-    public enum Operation: String, Codable, Sendable { case status, apply, heartbeat, restore, prepareUninstall, cancelUninstall }
+    public enum Operation: String, Codable, Sendable {
+        case status, apply, heartbeat, restore, prepareUninstall, cancelUninstall
+        case sleepStatus, sleepEnable, sleepHeartbeat, sleepDisable, sleepDiagnostics
+
+        public var isSleepOperation: Bool {
+            switch self {
+            case .sleepStatus, .sleepEnable, .sleepHeartbeat, .sleepDisable, .sleepDiagnostics: true
+            default: false
+            }
+        }
+    }
     public var version = HelperConstants.protocolVersion
     public var operation: Operation
     public var policies: [FanPolicy]
@@ -35,6 +46,8 @@ public struct HelperReply: Codable, Sendable {
     /// 仅表示 apply 的写入前校验失败；旧服务没有此字段时按普通错误处理。
     public var readingsNotReady: Bool?
     public var ownsSession = false
+    public var sleepStatus: SleepInhibitionStatus?
+    public var sleepDiagnostics: String?
     public init(available: Bool, status: SessionStatus? = nil, error: String? = nil) {
         self.available = available; self.status = status; self.error = error
     }

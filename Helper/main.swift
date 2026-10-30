@@ -28,6 +28,9 @@ private final class RecoveryJournal: ControlJournal {
 
 private actor HelperWorker {
     private let device = SMCDevice(allowWrites: true)
+    let sleepWorker: SleepWorker
+    init(sleepWorker: SleepWorker) { self.sleepWorker = sleepWorker }
+    private var removalOwner: UUID?
     private var session: ControlSession?
     private var initializationError: String?
     private var nextInitializationAttempt: TimeInterval = 0
@@ -49,7 +52,7 @@ private actor HelperWorker {
         }
     }
 
-    func request(_ data: Data, connection: ClientConnection) -> Data {
+    func request(_ data: Data, connection: ClientConnection) async -> Data {
         let client = connection.id
         var response = HelperReply(available: false)
         do {
@@ -57,6 +60,33 @@ private actor HelperWorker {
             guard data.count <= 65_536 else { throw ControlError.invalidConfiguration }
             let request = try JSONDecoder().decode(HelperRequest.self, from: data)
             guard request.version == HelperConstants.protocolVersion, request.policies.count <= 16 else { throw ControlError.invalidConfiguration }
+            if request.operation.isSleepOperation {
+                guard removalOwner == nil || request.operation != .sleepEnable else { throw SleepInhibitionError.busy }
+                let reply = await sleepWorker.request(request.operation, client: client, isOpen: { connection.isOpen })
+                return (try? JSONEncoder().encode(reply)) ?? Data()
+            }
+            if request.operation == .prepareUninstall {
+                guard removalOwner == nil || removalOwner == client else { throw SleepInhibitionError.busy }
+                removalOwner = client
+                let reply = await sleepWorker.request(.prepareUninstall, client: client, isOpen: { connection.isOpen })
+                if let error = reply.error { removalOwner = nil; throw HelperOperationError(message: error) }
+                do {
+                    guard connection.isOpen else { throw SessionError.notOwner }
+                    try session?.prepareRemoval(client: client)
+                } catch {
+                    _ = await sleepWorker.request(.cancelUninstall, client: client, isOpen: { connection.isOpen })
+                    removalOwner = nil
+                    throw error
+                }
+                return (try? JSONEncoder().encode(HelperReply(available: false, status: session?.status))) ?? Data()
+            }
+            if request.operation == .cancelUninstall {
+                guard removalOwner == client else { throw SessionError.notOwner }
+                _ = await sleepWorker.request(.cancelUninstall, client: client, isOpen: { connection.isOpen })
+                try session?.cancelRemoval(client: client)
+                removalOwner = nil
+                return (try? JSONEncoder().encode(HelperReply(available: false, status: session?.status))) ?? Data()
+            }
             initialize(force: request.operation == .restore)
             response.error = initializationError
             response.available = device.controlAvailable && session != nil && session?.preparingRemoval == false
@@ -66,12 +96,9 @@ private actor HelperWorker {
                 case .status: break
                 case .heartbeat: session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
                 case .restore: try session.release(client: client)
-                case .prepareUninstall:
-                    try session.prepareRemoval(client: client)
-                case .cancelUninstall:
-                    try session.cancelRemoval(client: client)
+                case .prepareUninstall, .cancelUninstall, .sleepStatus, .sleepEnable, .sleepHeartbeat, .sleepDisable, .sleepDiagnostics: break
                 case .apply:
-                    guard device.controlAvailable else { throw ControlError.readOnly }
+                    guard removalOwner == nil, connection.isOpen, device.controlAvailable else { throw ControlError.readOnly }
                     let state = ProcessInfo.processInfo.thermalState
                     guard state != .serious, state != .critical else { throw ControlError.readOnly }
                     try session.apply(request.policies, temperatureSources: request.temperatureSources,
@@ -99,7 +126,17 @@ private actor HelperWorker {
         let state = ProcessInfo.processInfo.thermalState
         session?.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: state == .serious || state == .critical)
     }
-    func disconnected(_ id: UUID) { session?.disconnected(client: id) }
+    func disconnected(_ id: UUID) async {
+        session?.disconnected(client: id)
+        if removalOwner == id { removalOwner = nil }
+        await sleepWorker.disconnected(id)
+    }
+
+}
+
+private struct HelperOperationError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 /// XPC 关闭回调先同步失效此标记，避免排队中的旧请求在断连后重新取得控制。
@@ -116,7 +153,18 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
     let worker: HelperWorker
     init(connection: ClientConnection, worker: HelperWorker) { self.connection = connection; self.worker = worker }
     func request(_ data: Data, reply: @escaping @Sendable (Data) -> Void) {
-        Task { reply(await worker.request(data, connection: connection)) }
+        Task {
+            // 电源请求也绕过风扇执行器，SMC 阻塞不能饿死电源租约。 / Route power requests independently of SMC stalls.
+            if data.count <= 65_536,
+               let request = try? JSONDecoder().decode(HelperRequest.self, from: data),
+               request.version == HelperConstants.protocolVersion, request.policies.count <= 16,
+               request.operation.isSleepOperation {
+                let response = await worker.sleepWorker.request(request.operation, client: connection.id, isOpen: { self.connection.isOpen })
+                reply((try? JSONEncoder().encode(response)) ?? Data())
+            } else {
+                reply(await worker.request(data, connection: connection))
+            }
+        }
     }
 }
 
@@ -136,14 +184,17 @@ private final class Listener: NSObject, NSXPCListenerDelegate {
     }
 }
 
+if BacklightSession.runIfRequested() { exit(0) }
 if LocalInstallation.runIfRequested() { exit(0) }
 guard geteuid() == 0, let trust = try? InstalledTrust.read(),
       (try? trust.helper.validateRunningProcess()) != nil else {
     FileHandle.standardError.write(Data("Helper requires root and the installed code identity.\n".utf8))
     exit(1)
 }
+SleepDiagnosticLog.helper.event("helper", "process.start", "protocol=\(HelperConstants.protocolVersion) hash=\(trust.helper.hash) OS=\(ProcessInfo.processInfo.operatingSystemVersionString)")
 let requirement = trust.client.requirement
-private let worker = HelperWorker()
+private let sleepWorker = SleepWorker()
+private let worker = HelperWorker(sleepWorker: sleepWorker)
 private let delegate = Listener(worker: worker, requirement: requirement)
 let listener = NSXPCListener(machServiceName: HelperConstants.machService)
 listener.delegate = delegate
@@ -151,6 +202,12 @@ listener.resume()
 Task(priority: .userInitiated) {
     while !Task.isCancelled {
         await worker.tick()
+        try? await Task.sleep(for: .seconds(1))
+    }
+}
+Task(priority: .userInitiated) {
+    while !Task.isCancelled {
+        await sleepWorker.tick()
         try? await Task.sleep(for: .seconds(1))
     }
 }
