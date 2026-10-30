@@ -116,6 +116,7 @@ struct MenuBarView: View {
             }
             if store.connectionError != nil { Label(store.text("硬件连接异常", "Hardware connection issue"), systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
             Divider()
+            HStack {
             Menu(store.activePresetName) {
                 Button(store.text("系统自动", "System automatic")) {
                     if !store.canControl { showMainWindow() }
@@ -142,6 +143,10 @@ struct MenuBarView: View {
                     }
                 }
             }.disabled(store.controlPending)
+            Spacer()
+            Button(store.text("恢复自动", "Restore Automatic")) { store.restoreAutomatic() }
+                .disabled((!store.hasCustomControl && !store.recoveryUnconfirmed) || store.controlPending)
+            }
             Toggle(store.text("禁止休眠（含合盖）", "Prevent sleep (including lid close)"), isOn: Binding(
                 get: { store.sleepControl.isOn },
                 set: { store.setSleepInhibition($0) }
@@ -159,14 +164,6 @@ struct MenuBarView: View {
                      : store.text("合盖时关闭内屏与键盘背光；低电量、高热或退出时恢复睡眠。开启期间也会阻止手动睡眠。", "Turns off built-in backlights when closed. Ends on low battery, heat or quit. Also blocks manual sleep."))
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            Button(store.text("导出诊断信息…", "Export diagnostics…")) {
-                DispatchQueue.main.async {
-                    NSApp.activate(ignoringOtherApps: true)
-                    store.exportDiagnostics()
-                }
-            }
-            Button(store.text("全部恢复系统自动", "Restore all to automatic")) { store.restoreAutomatic() }
-                .disabled((!store.hasCustomControl && !store.recoveryUnconfirmed) || store.controlPending)
             Button(store.text("检查更新…", "Check for Updates…")) { updater.checkForUpdates() }
                 .disabled(!updater.canCheckForUpdates)
             Divider()

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreText
 import SwiftUI
 
@@ -59,39 +60,42 @@ private struct FanControlCommands: Commands {
 
 struct MenuBarStatusLabel: View {
     @Environment(AppStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var angle = 0.0
+    @State private var lastTick = Date()
+    private let timer = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let lines = store.menuLines
-        if lines.isEmpty {
-            Image(systemName: "fan.fill")
-                .font(.system(size: 12))
-                .accessibilityLabel("Fan Control")
-        } else {
-            Image(nsImage: MenuBarStatusArtwork.make(lines: lines, showIcon: store.settings.showMenuIcon))
-                .interpolation(.high)
-                .accessibilityLabel("Fan Control · " + lines.joined(separator: " · "))
-        }
+        let showIcon = lines.isEmpty || store.settings.showMenuIcon
+        Image(nsImage: MenuBarStatusArtwork.make(lines: lines, showIcon: showIcon,
+              angle: angle, sleepOn: store.sleepControl.isOn, dark: colorScheme == .dark))
+            .interpolation(.high)
+            .accessibilityLabel((["Fan Control"] + lines + (store.sleepControl.isOn ? [store.text("禁止休眠已开启", "Sleep prevention on")] : [])).joined(separator: " · "))
+            .onReceive(timer) { date in
+                let elapsed = min(max(date.timeIntervalSince(lastTick), 0), 0.1)
+                lastTick = date
+                if showIcon { angle = (angle + elapsed * store.menuFanSpeed * 2 * .pi).truncatingRemainder(dividingBy: 2 * .pi) }
+            }
     }
 }
 
 /// MenuBarExtra 会把复杂标签压成单行；预绘制内容可保持系统菜单栏内的两行排版。
 @MainActor
 enum MenuBarStatusArtwork {
-    private static var cached: (lines: [String], showIcon: Bool, image: NSImage)?
     private static let fanSymbol = NSImage(systemSymbolName: "fan.fill", accessibilityDescription: nil)?
-        .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))?
+        .withSymbolConfiguration(.init(pointSize: 18, weight: .medium))?
         .cgImage(forProposedRect: nil, context: nil, hints: nil)
 
-    static func make(lines: [String], showIcon: Bool) -> NSImage {
-        if let cached, cached.lines == lines, cached.showIcon == showIcon { return cached.image }
+    static func make(lines: [String], showIcon: Bool, angle: Double, sleepOn: Bool, dark: Bool) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: lines.count == 2 ? 9 : 12, weight: .medium)
         let attributes: [NSAttributedString.Key: Any] = [.font: font,
-            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1)]
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: sleepOn && dark ? 1 : 0, alpha: 1)]
         let textLines = lines.map { CTLineCreateWithAttributedString(NSAttributedString(string: $0, attributes: attributes)) }
         let widths = textLines.map { ceil(CTLineGetTypographicBounds($0, nil, nil, nil)) }
         let textWidth = widths.max() ?? 0
-        let textX: CGFloat = showIcon ? 20 : 2
-        let size = NSSize(width: textX + textWidth + 2, height: 22)
+        let textX: CGFloat = showIcon ? 24 : 2
+        let size = NSSize(width: lines.isEmpty ? 24 : textX + textWidth + 2, height: 22)
         // 将当前内容一次性绘制成 Retina 位图，避免菜单栏重绘时再次执行文字及图标绘制。
         let scale: CGFloat = 2
         guard let bitmap = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
@@ -102,7 +106,25 @@ enum MenuBarStatusArtwork {
         bitmap.scaleBy(x: scale, y: scale)
         // 直接绘制到独立 CGContext，不切换 AppKit 当前上下文或翻转其坐标系。
         if showIcon, let fanSymbol {
-            bitmap.draw(fanSymbol, in: CGRect(x: 2, y: 4, width: 14, height: 14))
+            bitmap.saveGState()
+            bitmap.translateBy(x: 11, y: 11)
+            bitmap.rotate(by: angle)
+            bitmap.clip(to: CGRect(x: -9, y: -9, width: 18, height: 18), mask: fanSymbol)
+            bitmap.setFillColor(CGColor(gray: sleepOn && dark ? 1 : 0, alpha: 1))
+            bitmap.fill(CGRect(x: -9, y: -9, width: 18, height: 18))
+            bitmap.restoreGState()
+            if sleepOn, let badge = NSImage(systemSymbolName: "infinity.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))?
+                .cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                let rect = CGRect(x: 12, y: 1, width: 9, height: 9)
+                bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+                bitmap.fillEllipse(in: rect.insetBy(dx: 1, dy: 1))
+                bitmap.saveGState()
+                bitmap.clip(to: rect, mask: badge)
+                bitmap.setFillColor(NSColor.systemRed.cgColor)
+                bitmap.fill(rect)
+                bitmap.restoreGState()
+            }
         }
         for (index, line) in textLines.enumerated() {
             let x = textX + (textWidth - widths[index]) / 2
@@ -112,8 +134,7 @@ enum MenuBarStatusArtwork {
         }
         guard let raster = bitmap.makeImage() else { return NSImage(size: size) }
         let image = NSImage(cgImage: raster, size: size)
-        image.isTemplate = true
-        cached = (lines, showIcon, image)
+        image.isTemplate = !sleepOn
         return image
     }
 }

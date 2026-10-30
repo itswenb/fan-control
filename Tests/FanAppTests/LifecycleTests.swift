@@ -315,7 +315,7 @@ struct LifecycleTests {
         f.store.snapshot = f.driver.value
     }
 
-    @Test func closingIconOnlyWindowStopsMonitoringAndKeepsControlHeartbeat() async throws {
+    @Test func closingIconOnlyWindowKeepsMonitoringAndControlHeartbeat() async throws {
         let f = try Fixture()
         defer { f.close() }
         try await f.store.applyFullSpeed()
@@ -326,7 +326,7 @@ struct LifecycleTests {
         let samples = f.reader.samples
         let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
         try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= heartbeats + 2 }
-        #expect(f.reader.samples == samples)
+        #expect(f.reader.samples > samples)
         #expect(f.service.applyCount == 1)
         f.store.setDetailedMonitoring(true)
         try await waitUntil { f.reader.samples > samples }
@@ -349,7 +349,7 @@ struct LifecycleTests {
         try await waitUntil { f.reader.fullSamples > fullSamples }
     }
 
-    @Test func backgroundAutomaticStopsPollingAndControlSelectionRestartsHeartbeat() async throws {
+    @Test func backgroundAutomaticKeepsMonitoringAndControlSelectionRestartsHeartbeat() async throws {
         let f = try Fixture()
         defer { f.close() }
         f.store.settings.menuDisplay = .none
@@ -359,11 +359,11 @@ struct LifecycleTests {
         try await Task.sleep(for: .milliseconds(100))
         let samples = f.reader.samples, requests = f.service.requests.count
         try await Task.sleep(for: .milliseconds(2_100))
-        #expect(f.reader.samples == samples && f.service.requests.count == requests)
+        #expect(f.reader.samples > samples && f.service.requests.count == requests)
         try await f.store.applyFullSpeed()
         try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= 2 }
         #expect(f.service.applyCount == 1)
-        #expect(f.reader.samples == samples)
+        #expect(f.reader.samples > samples)
     }
 
     @Test func backgroundPresetRefreshesItsStaleSensorOnDemand() async throws {
@@ -380,7 +380,7 @@ struct LifecycleTests {
         #expect(f.service.applyCount == 1)
     }
 
-    @Test func iconOnlyBackgroundRecoveryObtainsFreshDataAndStopsMonitoringAfterResume() async throws {
+    @Test func iconOnlyBackgroundRecoveryKeepsMonitoringAfterResume() async throws {
         let f = try Fixture()
         defer { f.close() }
         f.store.settings.menuDisplay = .none
@@ -394,7 +394,7 @@ struct LifecycleTests {
         let samples = f.reader.samples
         let heartbeats = f.service.requests.filter { $0 == .heartbeat }.count
         try await waitUntil { f.service.requests.filter { $0 == .heartbeat }.count >= heartbeats + 2 }
-        #expect(f.reader.samples == samples)
+        #expect(f.reader.samples > samples)
         #expect(f.store.activeBuiltIn == "full")
     }
 

@@ -276,6 +276,13 @@ final class AppStore {
         }
     }
     var menuTitle: String { menuLines.joined(separator: "\n") }
+    var menuFanSpeed: Double {
+        let fans = snapshot?.fans ?? []
+        guard !fans.isEmpty, fans.allSatisfy({ $0.isFresh(at: now) && $0.maximum?.isFinite == true && ($0.maximum ?? 0) > 0 }) else { return 0 }
+        let current = fans.reduce(0.0) { $0 + ($1.rpm ?? 0) }
+        let maximum = fans.reduce(0.0) { $0 + ($1.maximum ?? 0) }
+        return min(max(current / maximum, 0), 1)
+    }
 
     func formattedTemperature(_ value: Double?, fresh: Bool = true) -> String {
         guard fresh, let value, value.isFinite else { return "—" }
@@ -377,7 +384,7 @@ final class AppStore {
     }
 
     private var needsMonitoring: Bool {
-        detailedMonitoring || menuPresented || settings.menuDisplay != .none || needsResumeReadings
+        detailedMonitoring || menuPresented || settings.menuDisplay != .none || needsResumeReadings || started
     }
 
     private var needsResumeReadings: Bool {
