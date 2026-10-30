@@ -197,6 +197,7 @@ final class AppStore {
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let helper: any ControlServiceConnection
     @ObservationIgnored private let sleepLog: SleepDiagnosticLog
+    @ObservationIgnored private var diagnosticExportPending = false
 
     init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil,
          reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient(),
@@ -951,14 +952,28 @@ final class AppStore {
     }
 
     func exportDiagnostics() {
+        guard !diagnosticExportPending else { return }
+        diagnosticExportPending = true
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "FanControl-diagnostics.txt"
         panel.allowedContentTypes = [.plainText]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let started = ProcessInfo.processInfo.systemUptime
+        sleepLog.event("app", "diagnostics.panel_opened", "sleepPhase=\(sleepControl.phase)")
         Task {
+            defer { diagnosticExportPending = false }
+            // 异步展示，选保存位置时继续维持控制心跳。 / Keep control heartbeats running while choosing a destination.
+            let response = await panel.begin()
+            sleepLog.event("app", "diagnostics.panel_closed", "accepted=\(response == .OK) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
+            guard response == .OK, let url = panel.url else { return }
             let sleepDetails = await sleepControl.diagnosticDetails()
             let report = diagnosticReport + "\n\n" + sleepDetails
-            perform { try report.write(to: url, atomically: true, encoding: .utf8) }
+            do {
+                try report.write(to: url, atomically: true, encoding: .utf8)
+                sleepLog.event("app", "diagnostics.exported", "bytes=\(report.utf8.count)")
+            } catch {
+                sleepLog.event("app", "diagnostics.export_failed", SleepDiagnosticLog.describe(error), error: true)
+                perform { throw error }
+            }
         }
     }
 }
