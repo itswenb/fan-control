@@ -26,6 +26,30 @@ private final class RecoveryJournal: ControlJournal {
     }
 }
 
+private final class TimedFanDriver: FanControlDriver {
+    private let device: SMCDevice
+    init(device: SMCDevice) { self.device = device }
+
+    private func timed<T>(_ operation: String, _ body: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed >= 1 { SleepDiagnosticLog.helper.event("fan", "hardware.slow", "operation=\(operation) elapsed=\(elapsed)", error: true) }
+        }
+        return try body()
+    }
+
+    func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
+        try timed("snapshot") { try device.controlSnapshot(temperatureSources: temperatureSources) }
+    }
+    func setTarget(fanID: String, rpm: Double) throws {
+        try timed("setTarget") { try device.setTarget(fanID: fanID, rpm: rpm) }
+    }
+    func restoreAutomatic(fanID: String) throws {
+        try timed("restoreAutomatic") { try device.restoreAutomatic(fanID: fanID) }
+    }
+}
+
 private actor HelperWorker {
     private let device = SMCDevice(allowWrites: true)
     let sleepWorker: SleepWorker
@@ -41,7 +65,7 @@ private actor HelperWorker {
         guard session == nil, force || uptime >= nextInitializationAttempt else { return }
         do {
             let snapshot = try device.controlSnapshot(temperatureSources: [])
-            session = try ControlSession(driver: device, journal: RecoveryJournal(model: snapshot.model))
+            session = try ControlSession(driver: TimedFanDriver(device: device), journal: RecoveryJournal(model: snapshot.model))
             initializationError = nil
             retryDelay = 1
         } catch {
@@ -52,14 +76,18 @@ private actor HelperWorker {
         }
     }
 
-    func request(_ data: Data, connection: ClientConnection) async -> Data {
+    func request(_ data: Data, connection: ClientConnection, receivedAt: TimeInterval) async -> Data {
         let client = connection.id
         var response = HelperReply(available: false)
+        let queueDelay = ProcessInfo.processInfo.systemUptime - receivedAt
         do {
             guard connection.isOpen else { throw SessionError.notOwner }
             guard data.count <= 65_536 else { throw ControlError.invalidConfiguration }
             let request = try JSONDecoder().decode(HelperRequest.self, from: data)
             guard request.version == HelperConstants.protocolVersion, request.policies.count <= 16 else { throw ControlError.invalidConfiguration }
+            if queueDelay >= 1 {
+                SleepDiagnosticLog.helper.event("fan", "request.delayed", "operation=\(request.operation.rawValue) queueSeconds=\(queueDelay)", error: true)
+            }
             if request.operation.isSleepOperation {
                 guard removalOwner == nil || request.operation != .sleepEnable else { throw SleepInhibitionError.busy }
                 let reply = await sleepWorker.request(request.operation, client: client, isOpen: { connection.isOpen })
@@ -103,6 +131,9 @@ private actor HelperWorker {
                     guard state != .serious, state != .critical else { throw ControlError.readOnly }
                     try session.apply(request.policies, temperatureSources: request.temperatureSources,
                                       client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+                    // 写入确认后重新计时；断连期间完成写入时立即恢复。 / Renew after confirmation, or restore if disconnected.
+                    guard connection.isOpen else { session.disconnected(client: client); throw SessionError.notOwner }
+                    session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
                 }
             }
         } catch {
@@ -122,14 +153,18 @@ private actor HelperWorker {
     }
 
     func tick() {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed >= 1 { SleepDiagnosticLog.helper.event("fan", "tick.slow", "elapsed=\(elapsed)", error: true) }
+        }
         initialize()
         let state = ProcessInfo.processInfo.thermalState
         session?.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: state == .serious || state == .critical)
     }
-    func disconnected(_ id: UUID) async {
+    func disconnected(_ id: UUID) {
         session?.disconnected(client: id)
         if removalOwner == id { removalOwner = nil }
-        await sleepWorker.disconnected(id)
     }
 
 }
@@ -153,6 +188,7 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
     let worker: HelperWorker
     init(connection: ClientConnection, worker: HelperWorker) { self.connection = connection; self.worker = worker }
     func request(_ data: Data, reply: @escaping @Sendable (Data) -> Void) {
+        let receivedAt = ProcessInfo.processInfo.systemUptime
         Task {
             // 电源请求也绕过风扇执行器，SMC 阻塞不能饿死电源租约。 / Route power requests independently of SMC stalls.
             if data.count <= 65_536,
@@ -162,7 +198,7 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
                 let response = await worker.sleepWorker.request(request.operation, client: connection.id, isOpen: { self.connection.isOpen })
                 reply((try? JSONEncoder().encode(response)) ?? Data())
             } else {
-                reply(await worker.request(data, connection: connection))
+                reply(await worker.request(data, connection: connection, receivedAt: receivedAt))
             }
         }
     }
@@ -177,8 +213,16 @@ private final class Listener: NSObject, NSXPCListenerDelegate {
         connection.setCodeSigningRequirement(requirement)
         connection.exportedInterface = NSXPCInterface(with: FanHelperProtocol.self)
         connection.exportedObject = Endpoint(connection: client, worker: worker)
-        connection.invalidationHandler = { client.close(); Task { await worker.disconnected(client.id) } }
-        connection.interruptionHandler = { client.close(); Task { await worker.disconnected(client.id) } }
+        connection.invalidationHandler = {
+            client.close()
+            Task { await worker.disconnected(client.id) }
+            Task { await worker.sleepWorker.disconnected(client.id) }
+        }
+        connection.interruptionHandler = {
+            client.close()
+            Task { await worker.disconnected(client.id) }
+            Task { await worker.sleepWorker.disconnected(client.id) }
+        }
         connection.resume()
         return true
     }

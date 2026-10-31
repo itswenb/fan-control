@@ -100,7 +100,7 @@ public struct FanPreset: Codable, Sendable, Equatable, Identifiable {
 }
 
 public enum ControlError: Error, LocalizedError, Equatable {
-    case invalidRange, invalidRPM, invalidThresholds, missingSensor, staleSensor, missingFan
+    case invalidRange, invalidRPM, invalidThresholds, missingSensor, staleSensor, missingFan, samplingInterrupted
     case duplicateFan, wrongDevice, readOnly, unsupportedFan, invalidName, duplicateName, invalidConfiguration, invalidSignature
 
     public var errorDescription: String? {
@@ -110,6 +110,7 @@ public enum ControlError: Error, LocalizedError, Equatable {
         case .invalidThresholds: "请输入有效温度，开始温度必须低于最高转速温度。"
         case .missingSensor: "所选温度传感器不可用。"
         case .staleSensor: "温度数据已失效，已停止使用旧数据调速。"
+        case .samplingInterrupted: "硬件采样耗时过长，已停止使用旧读数调速。"
         case .missingFan: "预设中的风扇在当前设备上不可用。"
         case .duplicateFan: "同一只风扇不能同时应用两条策略。"
         case .wrongDevice: "预设属于其他设备或数据源，不能在这里应用。"

@@ -13,6 +13,7 @@ private final class MemorySMC: SMCTransport {
     var cachedUnavailable = Set<String>()
     var reopens = 0
     var onReopen: (() -> Void)?
+    var onRead: ((String) -> Void)?
 
     init() {
         values["FNum"] = ("ui8 ", [2])
@@ -30,6 +31,7 @@ private final class MemorySMC: SMCTransport {
     }
     func read(_ key: String) throws -> (type: String, bytes: [UInt8]) {
         reads.append(key)
+        onRead?(key)
         if unavailableOnNextRead.remove(key) != nil { cachedUnavailable.insert(key) }
         guard !cachedUnavailable.contains(key) else { throw HardwareError.invalidResponse }
         if let transient = transientValues.removeValue(forKey: key) { return transient }
@@ -161,6 +163,86 @@ struct ControlSamplingTests {
         #expect(smc.reads.filter { $0 == "Tp09" }.count == 2)
         #expect(!smc.reads.contains("Tg05"))
         #expect(smc.reopens == 1)
+    }
+
+    @Test func slowSamplingRestoresControlWithoutRetryingStaleReadings() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        var clock: TimeInterval = 0
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        let session = try ControlSession(driver: device, journal: journal)
+        let source = ControlTemperatureSource(id: SensorCatalog.cpuAverageKey, group: .cpu, keys: ["Tp01", "Tp09"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        smc.reads = []; smc.writes = []
+        smc.set("Tp09", 0)
+        smc.onRead = { key in if key == "Tp09" { clock = 4 } }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(session.status.owner == nil && session.status.recoveryReason == .samplingInterrupted)
+        #expect(smc.reopens == 0 && smc.reads.filter { $0 == "Tp09" }.count == 1)
+        #expect(smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty)
+    }
+
+    @Test func slowFanReadSkipsTemperatureSampling() throws {
+        let smc = MemorySMC()
+        var clock: TimeInterval = 0
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        smc.onRead = { key in if key == "FNum" { clock = 4 } }
+        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+        do {
+            _ = try device.controlSnapshot(temperatureSources: [source])
+            Issue.record("Slow fan sampling must fail")
+        } catch ControlError.samplingInterrupted {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(!smc.reads.contains("Tp01") && smc.reopens == 0 && smc.writes.isEmpty)
+    }
+
+    @Test func slowRPMReadSkipsRemainingFanReads() throws {
+        let smc = MemorySMC()
+        var clock: TimeInterval = 0
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        smc.onRead = { key in if key == "F0Ac" { clock = 4 } }
+        #expect(throws: ControlError.samplingInterrupted) { try device.controlSnapshot(temperatureSources: []) }
+        #expect(smc.reads == ["FNum", "F0Ac"] && smc.writes.isEmpty)
+    }
+
+    @Test func slowPreflightNeverWritesAndCanRetryWhenSamplingRecovers() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        var clock: TimeInterval = 0
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        let session = try ControlSession(driver: device, journal: journal)
+        let policy = FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)
+        smc.onRead = { key in if key == "FNum" { clock = 4 } }
+        do {
+            try session.apply([policy], client: client, uptime: 10, now: Date())
+            Issue.record("Slow preflight must fail")
+        } catch SessionError.readingsNotReady {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(smc.writes.isEmpty && journal.fans.isEmpty && session.status.owner == nil)
+        smc.onRead = nil
+        try session.apply([policy], client: client, uptime: 11, now: Date())
+        #expect(session.status.owner == client)
+    }
+
+    @Test func blockedHardwareReadCannotApplyAStaleTargetAfterItReturns() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+        let session = try ControlSession(driver: device, journal: journal)
+        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        smc.writes = []
+        smc.set("Tp01", 80)
+        smc.onRead = { key in if key == "Tp01" { Thread.sleep(forTimeInterval: 3.1) } }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(session.status.recoveryReason == .samplingInterrupted && session.status.owner == nil)
+        #expect(smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty)
+        #expect(smc.writes == ["F0md", "F0Tg"])
     }
 
     @Test func temporarilyUnavailableKeyAfterPowerRecoveryIsNotCachedForever() throws {

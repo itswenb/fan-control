@@ -45,6 +45,8 @@ struct SettingsView: View {
             Section(store.text("菜单栏", "Menu bar")) {
                 Toggle(store.text("显示图标", "Show icon"), isOn: $store.settings.showMenuIcon)
                     .disabled(store.settings.menuDisplay == .none)
+                Toggle(store.text("图标旋转动画", "Animate fan icon"), isOn: $store.settings.animateMenuIcon)
+                    .disabled(!store.settings.showMenuIcon && store.settings.menuDisplay != .none)
                 Picker(store.text("显示内容", "Display content"), selection: Binding(
                     get: { store.settings.menuDisplay },
                     set: { value in

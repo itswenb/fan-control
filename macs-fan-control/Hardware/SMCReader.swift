@@ -142,20 +142,24 @@ public final class SMCDevice: FanControlDriver {
     private let model = SMCDevice.systemString("hw.model")
     private let chip = SMCDevice.systemString("machdep.cpu.brand_string")
     private let allowWrites: Bool
+    private let uptime: () -> TimeInterval
     private var supportedFans = Set<String>()
     private var temperatureLayout: (readings: [SensorReading], sources: [ControlTemperatureSource])?
 
     public init(allowWrites: Bool = false) {
         self.allowWrites = allowWrites
+        uptime = { ProcessInfo.processInfo.systemUptime }
         monitoringTemperatures = nil
         hidTemperatures = { HIDSensorReader.read() }
     }
 
     // 测试替身必须显式传入，测试控制和恢复路径时不会打开真实 SMC。
     init(allowWrites: Bool, connection: any SMCTransport, monitoringTemperatures: @escaping (Date) -> [SensorReading],
-         hidTemperatures: @escaping () -> [(name: String, celsius: Double)] = { [] }) {
+         hidTemperatures: @escaping () -> [(name: String, celsius: Double)] = { [] },
+         uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.allowWrites = allowWrites; self.connection = connection
         self.monitoringTemperatures = monitoringTemperatures; self.hidTemperatures = hidTemperatures
+        self.uptime = uptime
     }
 
     public var controlAvailable: Bool {
@@ -173,7 +177,7 @@ public final class SMCDevice: FanControlDriver {
     public func snapshot() throws -> HardwareSnapshot {
         var snapshot = try fanSnapshot(includeNames: true)
         if let layout = temperatureLayout, let connection {
-            let readings = readTemperatures(layout.sources, connection: connection)
+            let readings = try readTemperatures(layout.sources, connection: connection)
             if readings.allSatisfy({ $0.celsius != nil }) {
                 snapshot.sensors = zip(layout.readings, readings).map { previous, reading in
                     var value = reading
@@ -204,32 +208,46 @@ public final class SMCDevice: FanControlDriver {
     }
 
     public func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
-        var snapshot = try fanSnapshot(includeNames: false)
+        let started = uptime()
+        func checkDeadline() throws {
+            guard uptime() - started <= 3 else { throw ControlError.samplingInterrupted }
+        }
+        var snapshot = try fanSnapshot(includeNames: false, checkDeadline: checkDeadline)
+        try checkDeadline()
         guard !temperatureSources.isEmpty, let connection else { return snapshot }
-        snapshot.sensors = readTemperatures(temperatureSources, connection: connection)
+        snapshot.sensors = try readTemperatures(temperatureSources, connection: connection, checkDeadline: checkDeadline)
+        try checkDeadline()
         if snapshot.sensors.contains(where: { !$0.isFresh(at: Date()) }) {
             // 低电量深睡或重新上电后端口/不可用键缓存可能失效；只重开一次并重新读取。
             // 同时复核风扇控制权，不沿用旧温度、不跳过测点、不扫描或持续重试。
             try connection.reopen()
-            snapshot = try fanSnapshot(includeNames: false)
-            snapshot.sensors = readTemperatures(temperatureSources, connection: connection)
+            try checkDeadline()
+            snapshot = try fanSnapshot(includeNames: false, checkDeadline: checkDeadline)
+            try checkDeadline()
+            snapshot.sensors = try readTemperatures(temperatureSources, connection: connection, checkDeadline: checkDeadline)
+            try checkDeadline()
         }
         snapshot.timestamp = Date()
         return snapshot
     }
 
-    private func readTemperatures(_ temperatureSources: [ControlTemperatureSource], connection: any SMCTransport) -> [SensorReading] {
+    private func readTemperatures(_ temperatureSources: [ControlTemperatureSource], connection: any SMCTransport,
+                                  checkDeadline: () throws -> Void = {}) throws -> [SensorReading] {
         let keys = Set(temperatureSources.flatMap(\.keys))
         func isSMCKey(_ key: String) -> Bool { key.hasPrefix("T") && SMCCodec.fourCC(key) != nil }
         var values: [String: (celsius: Double, date: Date)] = [:]
         for key in keys where isSMCKey(key) {
+            try checkDeadline()
             if let value = connection.number(key), value.isFinite { values[key] = (value, Date()) }
+            try checkDeadline()
         }
         // 只有所选源含 HID 测点时才调用库；库目前按批次读取 HID，结果仅保留所需项。
         if keys.contains(where: { !isSMCKey($0) }) {
+            try checkDeadline()
             for value in hidTemperatures() where keys.contains(value.name) && value.celsius.isFinite {
                 values[value.name] = (value.celsius, Date())
             }
+            try checkDeadline()
         }
         return temperatureSources.map { source in
             let category: SensorCategory
@@ -257,15 +275,19 @@ public final class SMCDevice: FanControlDriver {
         return connection
     }
 
-    private func fanSnapshot(includeNames: Bool) throws -> HardwareSnapshot {
+    private func fanSnapshot(includeNames: Bool, checkDeadline: () throws -> Void = {}) throws -> HardwareSnapshot {
         let connection = try openConnection()
         let now = Date()
+        try checkDeadline()
         let countValue = connection.number("FNum")
+        try checkDeadline()
         let fanCountKnown = countValue.map { (0...16).contains($0) && $0.rounded() == $0 } ?? false
         supportedFans = []
-        let fans = (0..<(fanCountKnown ? Int(countValue ?? 0) : 0)).map { index in
+        let fans = try (0..<(fanCountKnown ? Int(countValue ?? 0) : 0)).map { index in
+            try checkDeadline()
             let id = "F" + String(index, radix: 16, uppercase: true)
-            let fan = readFan(id: id, connection: connection, at: now, includeName: includeNames)
+            let fan = try readFan(id: id, connection: connection, at: now, includeName: includeNames, checkDeadline: checkDeadline)
+            try checkDeadline()
             if fan.controlSupported { supportedFans.insert(id) }
             return fan
         }
@@ -274,14 +296,17 @@ public final class SMCDevice: FanControlDriver {
                                 sensors: [], timestamp: now, fanCountKnown: fanCountKnown, notice: notice)
     }
 
-    private func readFan(id: String, connection: any SMCTransport, at now: Date, includeName: Bool = false) -> FanReading {
+    private func readFan(id: String, connection: any SMCTransport, at now: Date, includeName: Bool = false,
+                         checkDeadline: () throws -> Void = {}) throws -> FanReading {
         let rpm = connection.number(id + "Ac").flatMap { (0...30_000).contains($0) ? $0 : nil }
+        try checkDeadline()
         var modeValue: SMCFanControl.Value?, targetValue: SMCFanControl.Value?
         let control = SMCFanControl.discover(fanID: id) { key in
             let value = try? connection.read(key)
             if key == id + "Tg" { targetValue = value } else { modeValue = value }
             return value
         }
+        try checkDeadline()
         let mode = control.flatMap { control in
             modeValue.flatMap { control.mode(from: $0) }
         }
@@ -294,8 +319,12 @@ public final class SMCDevice: FanControlDriver {
                 if let text, !text.isEmpty { name = text }
             }
         }
-        var fan = FanReading(id: id, name: name, rpm: rpm, minimum: connection.number(id + "Mn"),
-                             maximum: connection.number(id + "Mx"), mode: mode,
+        let minimum = connection.number(id + "Mn")
+        try checkDeadline()
+        let maximum = connection.number(id + "Mx")
+        try checkDeadline()
+        var fan = FanReading(id: id, name: name, rpm: rpm, minimum: minimum,
+                             maximum: maximum, mode: mode,
                              target: mode == .fixed ? targetValue.flatMap { SMCCodec.decode(type: $0.type, bytes: $0.bytes) } : nil,
                              sampledAt: rpm == nil ? nil : now)
         if let control, let range = fan.validRange, control.supports(range: range) { fan.controlSupported = true }
@@ -314,7 +343,7 @@ public final class SMCDevice: FanControlDriver {
         guard allowWrites else { throw ControlError.readOnly }
         guard SMCFanControl.fanIndex(fanID) != nil else { throw ControlError.missingFan }
         let connection = try openConnection()
-        let fan = readFan(id: fanID, connection: connection, at: Date())
+        let fan = try readFan(id: fanID, connection: connection, at: Date())
         guard fan.controlSupported, let control = SMCFanControl.discover(fanID: fanID, read: { try? connection.read($0) }) else {
             throw ControlError.unsupportedFan
         }

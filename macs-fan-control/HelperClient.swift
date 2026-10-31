@@ -15,6 +15,23 @@ protocol ControlServiceConnection: AnyObject {
     func disconnect()
 }
 
+/// 在 XPC 回调线程记录到达时间，避免主线程拥塞导致误判。 / Record XPC arrival before main-thread scheduling.
+final class RequestDeadline: @unchecked Sendable {
+    private let lock = NSLock()
+    private let deadline: TimeInterval
+    private var timelyReply = false
+
+    init(deadline: TimeInterval) { self.deadline = deadline }
+    func received(at uptime: TimeInterval) -> Bool {
+        lock.withLock {
+            guard uptime <= deadline else { return false }
+            timelyReply = true
+            return true
+        }
+    }
+    var hasTimelyReply: Bool { lock.withLock { timelyReply } }
+}
+
 @MainActor
 final class HelperClient: ControlServiceConnection {
     var diagnostics: SleepDiagnosticLog?
@@ -108,11 +125,13 @@ final class HelperClient: ControlServiceConnection {
         let connection = try connect()
         guard let connectionID else { throw HelperClientError.disconnected }
         let id = UUID()
+        let deadline = RequestDeadline(deadline: ProcessInfo.processInfo.systemUptime + 5)
         let response: HelperReply = try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             timeouts[id] = Task { [weak self] in
                 do { try await Task.sleep(for: .seconds(5)) } catch { return }
                 guard self?.pending[id] != nil else { return }
+                guard !deadline.hasTimelyReply else { return }
                 self?.diagnostics?.event("xpc", "request.timeout", "operation=\(request.operation.rawValue) connection=\(connectionID)", error: true)
                 self?.lostConnection(id: connectionID, error: HelperClientError.timeout)
             }
@@ -123,8 +142,14 @@ final class HelperClient: ControlServiceConnection {
                 Task { @MainActor in self?.lostConnection(id: connectionID, error: error) }
             }) as? FanHelperProtocol else { lostConnection(id: connectionID, error: ControlError.readOnly); return }
             remote.request(data) { @Sendable [weak self] response in
+                let timely = deadline.received(at: ProcessInfo.processInfo.systemUptime)
                 Task { @MainActor in
                     guard let self, self.connectionID == connectionID, self.pending[id] != nil else { return }
+                    guard timely else {
+                        self.diagnostics?.event("xpc", "request.timeout", "operation=\(request.operation.rawValue) connection=\(connectionID)", error: true)
+                        self.lostConnection(id: connectionID, error: HelperClientError.timeout)
+                        return
+                    }
                     do {
                         guard response.count <= 65_536 else { throw ControlError.invalidConfiguration }
                         let value = try JSONDecoder().decode(HelperReply.self, from: response)

@@ -169,4 +169,27 @@ struct SleepControllerTests {
         try await waitUntil { controller.phase == .off }
         #expect(service.operations.filter { $0 == .sleepEnable }.count == 1)
     }
+
+    @Test func fanDisconnectDoesNotEndIndependentSleepLease() async throws {
+        let fanService = FakeSleepService(), sleepService = FakeSleepService(), lights = FakeSleepLights()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "SleepControllerTests." + UUID().uuidString
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        let store = AppStore(defaults: defaults, storageDirectory: directory, reader: EmptyHardware(),
+                             helper: fanService, sleepLights: lights, sleepHelper: sleepService)
+        defer {
+            store.stop()
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        store.start()
+        try await store.sleepControl.setEnabled(true)
+        fanService.disconnect()
+        try await waitUntil { sleepService.heartbeats > 0 }
+        #expect(sleepService.active && store.sleepControl.phase == .on && lights.failure != nil)
+        sleepService.disconnect()
+        #expect(store.sleepControl.phase == .unknown)
+        try await waitUntil { store.sleepControl.phase == .off }
+        #expect(sleepService.operations.filter { $0 == .sleepEnable }.count == 1)
+    }
 }

@@ -31,6 +31,7 @@ struct AppSettings: Codable {
     var precise = true
     var language: AppLanguage = .system
     var showMenuIcon = true
+    var animateMenuIcon = true
     var menuDisplay: MenuDisplay = .both
     var sensorID: String = ""
     var fanID: String = ""
@@ -38,7 +39,7 @@ struct AppSettings: Codable {
     init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case unit, precise, language, showMenuIcon, menuDisplay, sensorID, fanID
+        case unit, precise, language, showMenuIcon, animateMenuIcon, menuDisplay, sensorID, fanID
     }
 
     init(from decoder: Decoder) throws {
@@ -47,6 +48,7 @@ struct AppSettings: Codable {
         unit = try values.decodeIfPresent(TemperatureUnit.self, forKey: .unit) ?? unit
         precise = try values.decodeIfPresent(Bool.self, forKey: .precise) ?? precise
         language = try values.decodeIfPresent(AppLanguage.self, forKey: .language) ?? language
+        animateMenuIcon = try values.decodeIfPresent(Bool.self, forKey: .animateMenuIcon) ?? animateMenuIcon
         sensorID = try values.decodeIfPresent(String.self, forKey: .sensorID) ?? sensorID
         fanID = try values.decodeIfPresent(String.self, forKey: .fanID) ?? fanID
         let savedDisplay = try values.decodeIfPresent(String.self, forKey: .menuDisplay)
@@ -196,19 +198,23 @@ final class AppStore {
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let helper: any ControlServiceConnection
+    @ObservationIgnored private let sleepHelper: any ControlServiceConnection
     @ObservationIgnored private let sleepLog: SleepDiagnosticLog
     @ObservationIgnored private var diagnosticExportPending = false
 
     init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil,
          reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient(),
-         sleepLights: (any LidBacklightManaging)? = nil) {
+         sleepLights: (any LidBacklightManaging)? = nil, sleepHelper: (any ControlServiceConnection)? = nil) {
         self.defaults = defaults
         self.reader = reader
         self.helper = helper
+        let sleepHelper = sleepHelper ?? (helper is HelperClient ? HelperClient() : helper)
+        self.sleepHelper = sleepHelper
         let log = Bundle.main.bundleIdentifier == HelperConstants.appIdentifier ? SleepDiagnosticLog.application : SleepDiagnosticLog()
         self.sleepLog = log
         (helper as? HelperClient)?.diagnostics = log
-        self.sleepControl = SleepInhibitionController(helper: helper, lights: sleepLights ?? LidBacklightController(diagnostics: log), diagnostics: log)
+        (sleepHelper as? HelperClient)?.diagnostics = log
+        self.sleepControl = SleepInhibitionController(helper: sleepHelper, lights: sleepLights ?? LidBacklightController(diagnostics: log), diagnostics: log)
         settings = defaults.data(forKey: "settings").flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) } ?? AppSettings()
         lastControl = defaults.data(forKey: "lastControlConfiguration").flatMap {
             try? JSONDecoder().decode(LastControlConfiguration.self, from: $0)
@@ -223,13 +229,16 @@ final class AppStore {
         sleepControl.onChange = { [weak self] in self?.updateControlActivity() }
         helper.onDisconnect = { [weak self] in
             guard let self else { return }
-            self.sleepControl.disconnected()
+            if self.helper === self.sleepHelper { self.sleepControl.disconnected() }
             self.controlRevision += 1
             self.helperAvailable = false
             self.helperSessionKnown = false
             self.displayPolicies = []; self.activePresetID = nil; self.activeBuiltIn = "automatic"
             if self.hasCustomControl || self.controlPending { self.recoveryUnconfirmed = true }
             self.refreshHelperRegistration()
+        }
+        if helper !== sleepHelper {
+            sleepHelper.onDisconnect = { [weak self] in self?.sleepControl.disconnected() }
         }
     }
 
@@ -509,6 +518,7 @@ final class AppStore {
         started = false
         startupRestorePending = false
         sleepControl.stop()
+        if helper !== sleepHelper { sleepHelper.disconnect() }
         helper.disconnect()
         endControlActivity()
     }

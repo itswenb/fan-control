@@ -4,6 +4,28 @@ import Testing
 import FanCore
 @testable import FanAppModel
 
+struct RequestDeadlineTests {
+    @Test func timelyReplySurvivesDelayedMainThreadAndLateReplyDoesNot() {
+        let timely = RequestDeadline(deadline: 5)
+        #expect(timely.received(at: 4.9))
+        #expect(timely.hasTimelyReply)
+
+        let late = RequestDeadline(deadline: 5)
+        #expect(!late.received(at: 5.1))
+        #expect(!late.hasTimelyReply)
+    }
+}
+
+struct MenuAnimationSettingsTests {
+    @Test func oldSettingsDefaultToAnimationAndChoicePersists() throws {
+        var settings = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
+        #expect(settings.animateMenuIcon)
+        settings.animateMenuIcon = false
+        let saved = try JSONEncoder().encode(settings)
+        #expect(!(try JSONDecoder().decode(AppSettings.self, from: saved).animateMenuIcon))
+    }
+}
+
 private final class MemoryJournal: ControlJournal {
     var fans = Set<String>()
     func load() throws -> Set<String> { fans }

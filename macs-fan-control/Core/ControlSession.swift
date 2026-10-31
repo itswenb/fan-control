@@ -90,7 +90,9 @@ public final class ControlSession {
         guard owner == nil || owner == client else { throw SessionError.busy }
         guard pending.isEmpty, !journalFailure else { throw SessionError.recoveryRequired }
         try ControlTemperatureSource.validate(temperatureSources, for: requested)
-        let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
+        let snapshot: HardwareSnapshot
+        do { snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources) }
+        catch ControlError.samplingInterrupted { throw SessionError.readingsNotReady }
         do { try PolicyValidator.validate(requested, in: snapshot, at: max(now, snapshot.timestamp)) }
         catch ControlError.staleSensor {
             // 仅此位置保证尚未写恢复日志、取得会话或写入风扇；写入后的故障不能重试。
@@ -150,6 +152,8 @@ public final class ControlSession {
             try PolicyValidator.validate(policies, in: snapshot, at: max(now, snapshot.timestamp))
             try verifyOwnership(in: snapshot)
             try update(snapshot: snapshot, now: now)
+        } catch ControlError.samplingInterrupted {
+            recover(reason: ControlError.samplingInterrupted.localizedDescription, cause: .samplingInterrupted)
         } catch { recover(reason: error.localizedDescription) }
     }
 
@@ -180,6 +184,7 @@ public final class ControlSession {
 
     private func update(snapshot: HardwareSnapshot, now: Date) throws {
         for policy in policies where policy.mode != .automatic {
+            try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, Date()))
             guard let fan = snapshot.fans.first(where: { $0.id == policy.fanID }) else { throw ControlError.missingFan }
             let sensor = snapshot.sensors.first { $0.id == policy.sensorID }
             guard let target = PolicyValidator.target(for: policy, fan: fan, temperature: sensor?.celsius) else { throw ControlError.invalidRPM }
@@ -189,6 +194,7 @@ public final class ControlSession {
             // 所有权已在本轮读取中核对；目标未变化时无需再次写入和等待 SMC 锁存。
             if confirmedTargets[fan.id] == commanded { continue }
             try driver.setTarget(fanID: fan.id, rpm: commanded)
+            try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, Date()))
             confirmedTargets[fan.id] = commanded
         }
     }

@@ -108,6 +108,7 @@ struct SleepInhibitionTests {
         driver.failRestore = false
         restarted.tick(uptime: 20)
         #expect(!restarted.status.active && !restarted.status.recoveryPending && !journal.pending && !driver.state.disabled)
+        #expect(restarted.status.message == "已恢复正常睡眠设置。")
     }
 
     @Test(arguments: [true, false]) func batteryOrThermalProtectionEndsSession(thermal: Bool) throws {

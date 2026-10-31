@@ -43,6 +43,8 @@ actor SleepWorker {
                 try session.enable(client: client, uptime: uptime)
                 // 写入途中断连也必须回收。 / Reclaim a lease closed during the system command.
                 if !isOpen() { session.disconnected(client: client); throw SleepInhibitionError.unconfirmed }
+                // 确认成功后开始租约，避免慢速写入消耗心跳窗口。 / Start the lease after a confirmed slow write.
+                session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
             case .sleepHeartbeat: session.heartbeat(client: client, uptime: uptime)
             case .sleepDisable: try session.release(client: client)
             case .prepareUninstall: try session.prepareRemoval(client: client)

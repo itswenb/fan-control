@@ -19,6 +19,7 @@ private final class FakeDriver: FanControlDriver {
     var writes: [String] = []
     var restores: [String] = []
     var requestedSources: [[ControlTemperatureSource]] = []
+    var onWrite: ((String) -> Void)?
     init(now: Date) {
         value = HardwareSnapshot(model: "test", chip: "test", source: .live,
                                  fans: ["F0", "F1"].map { FanReading(id: $0, name: $0, rpm: 2_000, minimum: 1_200, maximum: 6_000, mode: .automatic, sampledAt: now, controlSupported: true) },
@@ -30,6 +31,7 @@ private final class FakeDriver: FanControlDriver {
     }
     func setTarget(fanID: String, rpm: Double) throws {
         writes.append(fanID)
+        onWrite?(fanID)
         if failWrite == fanID { throw ControlError.invalidRPM }
         if let index = value.fans.firstIndex(where: { $0.id == fanID }) {
             value.fans[index].mode = .fixed; value.fans[index].target = rpm
@@ -43,6 +45,20 @@ private final class FakeDriver: FanControlDriver {
 }
 
 struct SessionTests {
+    @Test func slowWriteNeverAppliesAnotherFansStaleTemperature() throws {
+        let now = Date(), driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+        let session = try ControlSession(driver: driver, journal: journal)
+        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+        driver.onWrite = { id in if id == "F0" { Thread.sleep(forTimeInterval: 3.1) } }
+        #expect(throws: ControlError.staleSensor) {
+            try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: now)
+        }
+        #expect(driver.writes == ["F0"])
+        #expect(Set(driver.restores) == ["F0", "F1"] && journal.fans.isEmpty)
+        #expect(session.status.owner == nil && session.status.recoveryReason == .controlFailure)
+    }
+
     @Test func sensorPolicyKeepsOnlySelectedSourcesAndRejectsUnrelatedSourcesBeforeReading() throws {
         let now = Date(), driver = FakeDriver(now: Date()), client = UUID()
         let session = try ControlSession(driver: driver, journal: MemoryJournal())

@@ -137,7 +137,7 @@ public final class SleepInhibitionSession {
 
     public func tick(uptime: TimeInterval, thermalEmergency: Bool = false) {
         if pending {
-            if uptime >= nextRetry { nextRetry = uptime + 5; recover(reason: message ?? "正在重试恢复睡眠设置。") }
+            if uptime >= nextRetry { nextRetry = uptime + 5; recover(reason: "已恢复正常睡眠设置。") }
             return
         }
         guard active else { latest = try? driver.read(); return }
