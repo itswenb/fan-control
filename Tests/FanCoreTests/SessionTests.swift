@@ -45,18 +45,28 @@ private final class FakeDriver: FanControlDriver {
 }
 
 struct SessionTests {
-    @Test func slowWriteNeverAppliesAnotherFansStaleTemperature() throws {
-        let now = Date(), driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
-        let session = try ControlSession(driver: driver, journal: journal)
-        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
-        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
-        driver.onWrite = { id in if id == "F0" { Thread.sleep(forTimeInterval: 3.1) } }
-        #expect(throws: ControlError.staleSensor) {
-            try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: now)
+    @Test func slowWriteNeverAppliesAnotherFansStaleTemperature() async throws {
+        let result: (Bool, [String], Set<String>, Bool, Bool) = try await withCheckedThrowingContinuation { continuation in
+            // 在独立线程模拟阻塞，避免饿死其他并发测试。 / Simulate blocking on a separate thread without starving concurrent tests.
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let now = Date(), driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+                    let session = try ControlSession(driver: driver, journal: journal)
+                    let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+                    let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+                    driver.onWrite = { id in if id == "F0" { Thread.sleep(forTimeInterval: 3.1) } }
+                    var stale = false
+                    do { try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: now) }
+                    catch ControlError.staleSensor { stale = true }
+                    continuation.resume(returning: (stale, driver.writes, Set(driver.restores), journal.fans.isEmpty,
+                                                    session.status.owner == nil && session.status.recoveryReason == .controlFailure))
+                } catch { continuation.resume(throwing: error) }
+            }
         }
-        #expect(driver.writes == ["F0"])
-        #expect(Set(driver.restores) == ["F0", "F1"] && journal.fans.isEmpty)
-        #expect(session.status.owner == nil && session.status.recoveryReason == .controlFailure)
+        #expect(result.0)
+        #expect(result.1 == ["F0"])
+        #expect(result.2 == ["F0", "F1"] && result.3)
+        #expect(result.4)
     }
 
     @Test func sensorPolicyKeepsOnlySelectedSourcesAndRejectsUnrelatedSourcesBeforeReading() throws {

@@ -228,21 +228,30 @@ struct ControlSamplingTests {
         #expect(session.status.owner == client)
     }
 
-    @Test func blockedHardwareReadCannotApplyAStaleTargetAfterItReturns() throws {
-        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
-        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
-        let session = try ControlSession(driver: device, journal: journal)
-        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
-        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
-        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
-        smc.writes = []
-        smc.set("Tp01", 80)
-        smc.onRead = { key in if key == "Tp01" { Thread.sleep(forTimeInterval: 3.1) } }
-        session.heartbeat(client: client, uptime: 11)
-        session.tick(uptime: 11, now: Date())
-        #expect(session.status.recoveryReason == .samplingInterrupted && session.status.owner == nil)
-        #expect(smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty)
-        #expect(smc.writes == ["F0md", "F0Tg"])
+    @Test func blockedHardwareReadCannotApplyAStaleTargetAfterItReturns() async throws {
+        let result: (Bool, Bool, [String]) = try await withCheckedThrowingContinuation { continuation in
+            // 在独立线程模拟阻塞，避免饿死其他并发测试。 / Simulate blocking on a separate thread without starving concurrent tests.
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+                    let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] })
+                    let session = try ControlSession(driver: device, journal: journal)
+                    let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+                    let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+                    try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+                    smc.writes = []
+                    smc.set("Tp01", 80)
+                    smc.onRead = { key in if key == "Tp01" { Thread.sleep(forTimeInterval: 3.1) } }
+                    session.heartbeat(client: client, uptime: 11)
+                    session.tick(uptime: 11, now: Date())
+                    continuation.resume(returning: (session.status.recoveryReason == .samplingInterrupted && session.status.owner == nil,
+                                                    smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty, smc.writes))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+        #expect(result.0)
+        #expect(result.1)
+        #expect(result.2 == ["F0md", "F0Tg"])
     }
 
     @Test func temporarilyUnavailableKeyAfterPowerRecoveryIsNotCachedForever() throws {
