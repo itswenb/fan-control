@@ -36,6 +36,8 @@ private final class MemoryDriver: FanControlDriver {
     var value: HardwareSnapshot
     var restores = 0
     var staleControlReads = 0
+    var interruptedControlReads = 0
+    var interruptedFanOnlyReads = 0
     var failRestore = false
 
     init() {
@@ -47,6 +49,14 @@ private final class MemoryDriver: FanControlDriver {
     }
 
     func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
+        if temperatureSources.isEmpty, interruptedFanOnlyReads > 0 {
+            interruptedFanOnlyReads -= 1
+            throw ControlError.samplingInterrupted
+        }
+        if !temperatureSources.isEmpty, interruptedControlReads > 0 {
+            interruptedControlReads -= 1
+            throw ControlError.samplingInterrupted
+        }
         if !temperatureSources.isEmpty, staleControlReads > 0 {
             staleControlReads -= 1
             var reading = value
@@ -176,12 +186,13 @@ private final class Fixture {
     let suite = "FanControlLifecycleTests." + UUID().uuidString
     let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
 
-    init() throws {
+    init(controlSampleTimeout: Duration = .seconds(5)) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defaults = try #require(UserDefaults(suiteName: suite))
         reader = MemoryReader(driver: driver)
         service = try MemoryService(driver: driver)
-        store = AppStore(defaults: defaults, storageDirectory: directory, reader: reader, helper: service)
+        store = AppStore(defaults: defaults, storageDirectory: directory, reader: reader, helper: service,
+                         controlSampleTimeout: controlSampleTimeout)
         store.snapshot = driver.value
         store.helperAvailable = true
     }
@@ -205,6 +216,47 @@ struct LifecycleTests {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
+    }
+
+    @Test func blockedControlReadTimesOutWithoutLateWriteOrUnboundedRetries() async throws {
+        let f = try Fixture(controlSampleTimeout: .milliseconds(150))
+        defer { f.close() }
+        f.store.setDetailedMonitoring(false)
+        f.store.snapshot?.fans[0].sampledAt = Date().addingTimeInterval(-10)
+        f.store.snapshot?.sensors[0].sampledAt = Date().addingTimeInterval(-10)
+        f.reader.holdSample = true
+        let attempt = Task { try await f.store.apply([f.policy]) }
+        try await waitUntil { f.reader.sampleContinuation != nil }
+        do { try await attempt.value; Issue.record("A blocked hardware read must time out") }
+        catch { #expect(error.localizedDescription.contains("超时")) }
+        #expect(!f.store.controlPending && f.service.applyCount == 0)
+        do { try await f.store.apply([f.policy]); Issue.record("A second hardware read must not be queued") }
+        catch { #expect(error.localizedDescription.contains("尚未结束")) }
+        #expect(f.reader.samples == 1 && f.service.applyCount == 0)
+        f.reader.holdSample = false
+        f.reader.sampleContinuation?.resume(); f.reader.sampleContinuation = nil
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(f.service.applyCount == 0, "A late reading must never apply the expired request")
+        try await f.store.apply([f.policy])
+        #expect(f.service.applyCount == 1)
+    }
+
+    @Test func temporaryMaximumIsDisplayedAndClearedAfterFreshSampling() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.driver.interruptedControlReads = 1
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+        #expect(f.driver.value.fans[0].target == 6_000)
+        f.store.start()
+        try await waitUntil { f.store.fanSafetyMessage != nil }
+        #expect(f.store.fanSafetyMessage?.contains("暂时全速") == true)
+        f.driver.value.timestamp = Date()
+        f.driver.value.fans[0].sampledAt = Date()
+        f.driver.value.sensors[0].sampledAt = Date()
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+        try await waitUntil { f.store.fanSafetyMessage == nil }
+        #expect(f.service.session.status.owner == f.service.client)
     }
 
     @Test func liveReadingsDoNotInvalidateHardwareInformationOrSensorCatalog() throws {
@@ -434,6 +486,21 @@ struct LifecycleTests {
         #expect(f.store.activePresetName == "编译")
         #expect(f.store.displayPolicies == [f.policy])
         #expect(f.service.session.status.policies == [f.policy])
+    }
+
+    @Test func repeatedSlowSamplingRestoresAutomaticThenResumesAfterFreshReadings() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        try await f.store.apply([f.policy])
+        f.driver.interruptedControlReads = 1
+        f.driver.interruptedFanOnlyReads = 1
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+        #expect(f.service.session.status.recoveryReason == .samplingInterrupted)
+        #expect(f.driver.value.fans[0].mode == .automatic)
+        f.store.start()
+        try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
+        #expect(f.service.session.status.policies == [f.policy])
+        #expect(f.driver.value.fans[0].mode == .fixed)
     }
 
     @Test func delayedFullSpeedCheckDoesNotRestoreAutomaticOrReapply() async throws {

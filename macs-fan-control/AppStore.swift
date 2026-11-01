@@ -23,6 +23,29 @@ extension HardwareSampling {
 
 extension SMCReader: HardwareSampling {}
 
+private enum ControlSamplingError: LocalizedError {
+    case timeout, pending
+    var errorDescription: String? {
+        switch self {
+        case .timeout: "硬件读取超时，未应用新策略。"
+        case .pending: "上一次硬件读取尚未结束，请稍后重试。"
+        }
+    }
+}
+
+@MainActor
+private final class ControlSampleReply {
+    private var continuation: CheckedContinuation<HardwareSnapshot, any Error>?
+    var timeout: Task<Void, Never>?
+    init(_ continuation: CheckedContinuation<HardwareSnapshot, any Error>) { self.continuation = continuation }
+    func finish(_ result: Result<HardwareSnapshot, any Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        timeout?.cancel()
+        continuation.resume(with: result)
+    }
+}
+
 enum AppLanguage: String, Codable, CaseIterable { case system, chinese, english }
 enum MenuDisplay: String, Codable, CaseIterable { case none, temperature, fan, both }
 
@@ -155,6 +178,7 @@ final class AppStore {
     var loginNeedsApproval = false
     var helperAvailable = false
     var helperMessage = ""
+    private(set) var fanSafetyMessage: String?
     var controlPending = false
     var recoveryUnconfirmed = false {
         didSet {
@@ -201,12 +225,16 @@ final class AppStore {
     @ObservationIgnored private let sleepHelper: any ControlServiceConnection
     @ObservationIgnored private let sleepLog: SleepDiagnosticLog
     @ObservationIgnored private var diagnosticExportPending = false
+    @ObservationIgnored private var pendingControlSample: UUID?
+    @ObservationIgnored private let controlSampleTimeout: Duration
 
     init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil,
          reader: any HardwareSampling = SMCReader(), helper: any ControlServiceConnection = HelperClient(),
-         sleepLights: (any LidBacklightManaging)? = nil, sleepHelper: (any ControlServiceConnection)? = nil) {
+         sleepLights: (any LidBacklightManaging)? = nil, sleepHelper: (any ControlServiceConnection)? = nil,
+         controlSampleTimeout: Duration = .seconds(5)) {
         self.defaults = defaults
         self.reader = reader
+        self.controlSampleTimeout = controlSampleTimeout
         self.helper = helper
         let sleepHelper = sleepHelper ?? (helper is HelperClient ? HelperClient() : helper)
         self.sleepHelper = sleepHelper
@@ -229,6 +257,7 @@ final class AppStore {
         sleepControl.onChange = { [weak self] in self?.updateControlActivity() }
         helper.onDisconnect = { [weak self] in
             guard let self else { return }
+            self.fanSafetyMessage = nil
             if self.helper === self.sleepHelper { self.sleepControl.disconnected() }
             self.controlRevision += 1
             self.helperAvailable = false
@@ -550,7 +579,7 @@ final class AppStore {
         let needsFreshSensors = temperatureSources.contains { source in snapshot.sensors.first(where: { $0.id == source.id })?.isFresh(at: date) != true }
         if !detailedMonitoring && (needsFreshFans || needsFreshSensors) {
             // 后台按用户操作补读所选策略需要的数据，不恢复完整持续采样。
-            let reading = try await reader.sample(temperatureSources: temperatureSources)
+            let reading = try await sampleForControl(temperatureSources)
             guard generation == expectedGeneration, !isSuspended, helperAvailable, !recoveryUnconfirmed else { throw ControlError.readOnly }
             snapshot = mergeMonitoringReadings(reading)
             self.snapshot = snapshot
@@ -578,6 +607,27 @@ final class AppStore {
         syncActivePreset()
         rememberControl()
         record(text("策略已应用：", "Policy applied: ") + activePresetName)
+    }
+
+    /// 超时只释放界面等待；旧读取结束前禁止排入新读取。 / Release the UI on timeout and do not queue another read until the old one finishes.
+    private func sampleForControl(_ sources: [ControlTemperatureSource]) async throws -> HardwareSnapshot {
+        guard pendingControlSample == nil else { throw ControlSamplingError.pending }
+        let id = UUID()
+        pendingControlSample = id
+        let reader = self.reader
+        let sample = Task.detached { try await reader.sample(temperatureSources: sources) }
+        return try await withCheckedThrowingContinuation { continuation in
+            let reply = ControlSampleReply(continuation)
+            reply.timeout = Task {
+                do { try await Task.sleep(for: controlSampleTimeout) } catch { return }
+                reply.finish(.failure(ControlSamplingError.timeout))
+            }
+            Task { [weak self] in
+                let result = await sample.result
+                if self?.pendingControlSample == id { self?.pendingControlSample = nil }
+                reply.finish(result)
+            }
+        }
     }
 
     func applyFan(_ policy: FanPolicy) async throws {
@@ -737,6 +787,10 @@ final class AppStore {
             recoveryUnconfirmed = status.recoveryBlocked || (recoveryUnconfirmed && status.owner != nil)
             helperAvailable = reply.available && !recoveryUnconfirmed
             helperMessage = reply.available ? text("控制服务已连接", "Control service connected") : (status.message ?? text("控制暂不可用：未检测到可用的调速接口，或另一连接正在使用服务。", "Control unavailable: no compatible fan control interface or another active connection."))
+            let safetyMessage = reply.ownsSession ? status.message : nil
+            if fanSafetyMessage != safetyMessage, let safetyMessage { record(safetyMessage) }
+            fanSafetyMessage = safetyMessage
+            if let safetyMessage { helperMessage = safetyMessage }
             if displayPolicies != status.policies { displayPolicies = status.policies }
             if !recoveryUnconfirmed {
                 // 服务确认安全故障时终止恢复；Never retry a confirmed safety failure.
@@ -815,6 +869,7 @@ final class AppStore {
             let reply = try await helper.request(HelperRequest(operation: .restore))
             guard reply.status?.recoveryBlocked == false else { throw SessionError.recoveryRequired }
             policies = []; activePresetID = nil; activeBuiltIn = "automatic"; recoveryUnconfirmed = false
+            fanSafetyMessage = nil
             displayPolicies = []; helperSessionKnown = true
             if rememberSelection { rememberControl() }
             record(text("已确认恢复系统自动。", "Restored to automatic mode."))

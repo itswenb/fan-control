@@ -51,6 +51,8 @@ private final class TimedFanDriver: FanControlDriver {
 }
 
 private actor HelperWorker {
+    private let executor = BlockingSerialExecutor(label: "com.itswenb.fancontrol.fan-worker")
+    nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
     private let device = SMCDevice(allowWrites: true)
     let sleepWorker: SleepWorker
     init(sleepWorker: SleepWorker) { self.sleepWorker = sleepWorker }
@@ -59,6 +61,18 @@ private actor HelperWorker {
     private var initializationError: String?
     private var nextInitializationAttempt: TimeInterval = 0
     private var retryDelay: TimeInterval = 1
+    private var ownerConnection: ClientConnection?
+
+    private func publishOwnerStatus() {
+        guard let connection = ownerConnection, let session else { return }
+        let status = session.status
+        var reply = HelperReply(available: device.controlAvailable && !status.recoveryBlocked && !session.preparingRemoval,
+                                status: status)
+        reply.ownsSession = status.owner == connection.id
+        if let owner = status.owner, owner != connection.id { reply.available = false }
+        connection.inbox.publishFanReply(reply, at: ProcessInfo.processInfo.systemUptime)
+        if status.owner != connection.id { ownerConnection = nil }
+    }
 
     private func initialize(force: Bool = false) {
         let uptime = ProcessInfo.processInfo.systemUptime
@@ -85,6 +99,7 @@ private actor HelperWorker {
             guard data.count <= 65_536 else { throw ControlError.invalidConfiguration }
             let request = try JSONDecoder().decode(HelperRequest.self, from: data)
             guard request.version == HelperConstants.protocolVersion, request.policies.count <= 16 else { throw ControlError.invalidConfiguration }
+            if request.operation != .heartbeat && request.operation != .status { connection.inbox.invalidateFanReply() }
             if queueDelay >= 1 {
                 SleepDiagnosticLog.helper.event("fan", "request.delayed", "operation=\(request.operation.rawValue) queueSeconds=\(queueDelay)", error: true)
             }
@@ -122,7 +137,7 @@ private actor HelperWorker {
                 guard let session else { throw ControlError.readOnly }
                 switch request.operation {
                 case .status: break
-                case .heartbeat: session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
+                case .heartbeat: session.heartbeat(client: client, uptime: receivedAt)
                 case .restore: try session.release(client: client)
                 case .prepareUninstall, .cancelUninstall, .sleepStatus, .sleepEnable, .sleepHeartbeat, .sleepDisable, .sleepDiagnostics: break
                 case .apply:
@@ -134,6 +149,7 @@ private actor HelperWorker {
                     // 写入确认后重新计时；断连期间完成写入时立即恢复。 / Renew after confirmation, or restore if disconnected.
                     guard connection.isOpen else { session.disconnected(client: client); throw SessionError.notOwner }
                     session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
+                    if session.status.owner == client { ownerConnection = connection }
                 }
             }
         } catch {
@@ -149,6 +165,7 @@ private actor HelperWorker {
         response.ownsSession = session?.status.owner == client
         if let owner = session?.status.owner, owner != client { response.available = false }
         if session?.status.recoveryBlocked == true { response.available = false }
+        publishOwnerStatus()
         return (try? JSONEncoder().encode(response)) ?? Data()
     }
 
@@ -160,10 +177,18 @@ private actor HelperWorker {
         }
         initialize()
         let state = ProcessInfo.processInfo.thermalState
-        session?.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: state == .serious || state == .critical)
+        if let session, let connection = ownerConnection, session.status.owner == connection.id,
+           let heartbeat = connection.inbox.latest(.fan) {
+            session.heartbeat(client: connection.id, uptime: heartbeat)
+        }
+        let connection = ownerConnection
+        session?.tick(uptime: ProcessInfo.processInfo.systemUptime, now: Date(), thermalEmergency: state == .serious || state == .critical,
+                      ownerConnected: { connection?.isOpen == true })
+        publishOwnerStatus()
     }
     func disconnected(_ id: UUID) {
         session?.disconnected(client: id)
+        if ownerConnection?.id == id { ownerConnection = nil }
         if removalOwner == id { removalOwner = nil }
     }
 
@@ -177,10 +202,9 @@ private struct HelperOperationError: LocalizedError {
 /// XPC 关闭回调先同步失效此标记，避免排队中的旧请求在断连后重新取得控制。
 private final class ClientConnection: @unchecked Sendable {
     let id = UUID()
-    private let lock = NSLock()
-    private var open = true
-    var isOpen: Bool { lock.withLock { open } }
-    func close() { lock.withLock { open = false } }
+    let inbox = LeaseHeartbeatInbox()
+    var isOpen: Bool { inbox.isOpen }
+    func close() { inbox.close() }
 }
 
 private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
@@ -189,13 +213,22 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
     init(connection: ClientConnection, worker: HelperWorker) { self.connection = connection; self.worker = worker }
     func request(_ data: Data, reply: @escaping @Sendable (Data) -> Void) {
         let receivedAt = ProcessInfo.processInfo.systemUptime
+        let request = data.count <= 65_536 ? try? JSONDecoder().decode(HelperRequest.self, from: data) : nil
+        let valid = request?.version == HelperConstants.protocolVersion && (request?.policies.count ?? 17) <= 16
+        if valid, request?.operation == .heartbeat { connection.inbox.record(.fan, at: receivedAt) }
+        if valid, request?.operation == .sleepHeartbeat { connection.inbox.record(.sleep, at: receivedAt) }
+        if valid, request?.operation == .heartbeat,
+           let cached = connection.inbox.recentFanReply(at: receivedAt),
+           let data = try? JSONEncoder().encode(cached) {
+            reply(data)
+            return
+        }
         Task {
             // 电源请求也绕过风扇执行器，SMC 阻塞不能饿死电源租约。 / Route power requests independently of SMC stalls.
-            if data.count <= 65_536,
-               let request = try? JSONDecoder().decode(HelperRequest.self, from: data),
-               request.version == HelperConstants.protocolVersion, request.policies.count <= 16,
-               request.operation.isSleepOperation {
-                let response = await worker.sleepWorker.request(request.operation, client: connection.id, isOpen: { self.connection.isOpen })
+            if valid, let request, request.operation.isSleepOperation {
+                let response = await worker.sleepWorker.request(request.operation, client: connection.id,
+                    isOpen: { self.connection.isOpen }, receivedAt: receivedAt,
+                    latestHeartbeat: { self.connection.inbox.latest(.sleep) })
                 reply((try? JSONEncoder().encode(response)) ?? Data())
             } else {
                 reply(await worker.request(data, connection: connection, receivedAt: receivedAt))

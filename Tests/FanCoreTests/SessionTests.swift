@@ -20,6 +20,7 @@ private final class FakeDriver: FanControlDriver {
     var restores: [String] = []
     var requestedSources: [[ControlTemperatureSource]] = []
     var onWrite: ((String) -> Void)?
+    var onSnapshot: (([ControlTemperatureSource]) throws -> Void)?
     init(now: Date) {
         value = HardwareSnapshot(model: "test", chip: "test", source: .live,
                                  fans: ["F0", "F1"].map { FanReading(id: $0, name: $0, rpm: 2_000, minimum: 1_200, maximum: 6_000, mode: .automatic, sampledAt: now, controlSupported: true) },
@@ -27,6 +28,7 @@ private final class FakeDriver: FanControlDriver {
     }
     func controlSnapshot(temperatureSources: [ControlTemperatureSource]) throws -> HardwareSnapshot {
         requestedSources.append(temperatureSources)
+        try onSnapshot?(temperatureSources)
         return value
     }
     func setTarget(fanID: String, rpm: Double) throws {
@@ -45,6 +47,70 @@ private final class FakeDriver: FanControlDriver {
 }
 
 struct SessionTests {
+    @Test func externalTakeoverPreventsMaximumFallbackAndAutomaticResume() throws {
+        let driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+        let session = try ControlSession(driver: driver, journal: journal)
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: Date())
+        driver.writes = []
+        driver.onSnapshot = { sources in
+            if !sources.isEmpty { throw ControlError.samplingInterrupted }
+            driver.value.fans[0].target = 4_000
+        }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(driver.writes.isEmpty && journal.fans.isEmpty)
+        #expect(session.status.owner == nil && session.status.recoveryReason == .controlFailure)
+        driver.onSnapshot = nil
+    }
+
+    @Test func failedMaximumFallbackRestoresAllFansWithoutAutomaticResume() throws {
+        let driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+        let session = try ControlSession(driver: driver, journal: journal)
+        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+        try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: Date())
+        driver.writes = []
+        driver.failWrite = "F1"
+        driver.onSnapshot = { sources in if !sources.isEmpty { throw ControlError.samplingInterrupted } }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(driver.writes == ["F0", "F1"])
+        #expect(Set(driver.restores) == ["F0", "F1"] && journal.fans.isEmpty)
+        #expect(session.status.owner == nil && session.status.recoveryReason == .controlFailure)
+    }
+
+    @Test func disconnectDuringMaximumFallbackStopsFurtherWritesAndRestoresAllFans() throws {
+        let driver = FakeDriver(now: Date()), journal = MemoryJournal(), client = UUID()
+        let session = try ControlSession(driver: driver, journal: journal)
+        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+        try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: Date())
+        var connected = true
+        driver.writes = []
+        driver.onSnapshot = { sources in if !sources.isEmpty { throw ControlError.samplingInterrupted } }
+        driver.onWrite = { _ in connected = false }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date(), ownerConnected: { connected })
+        #expect(driver.writes == ["F0"])
+        #expect(Set(driver.restores) == ["F0", "F1"] && journal.fans.isEmpty)
+        #expect(session.status.owner == nil && session.status.recoveryReason == .disconnected)
+    }
+
+    @Test func queuedOlderHeartbeatDoesNotUndoNewerArrivalOrPreventExpiry() throws {
+        let driver = FakeDriver(now: Date()), client = UUID(), inbox = LeaseHeartbeatInbox()
+        let session = try ControlSession(driver: driver, journal: MemoryJournal())
+        try session.apply([FanPolicy(fanID: "F0", mode: .fixed, rpm: 2_000)], client: client, uptime: 10, now: Date())
+        inbox.record(.fan, at: 14)
+        session.heartbeat(client: client, uptime: try #require(inbox.latest(.fan)))
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 18.9, now: Date())
+        #expect(session.status.owner == client)
+        session.tick(uptime: 19.1, now: Date())
+        #expect(session.status.owner == nil && session.status.recoveryReason == .heartbeatExpired)
+    }
+
     @Test func slowWriteNeverAppliesAnotherFansStaleTemperature() async throws {
         let result: (Bool, [String], Set<String>, Bool, Bool) = try await withCheckedThrowingContinuation { continuation in
             // 在独立线程模拟阻塞，避免饿死其他并发测试。 / Simulate blocking on a separate thread without starving concurrent tests.

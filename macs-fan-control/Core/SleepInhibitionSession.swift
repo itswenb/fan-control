@@ -126,7 +126,7 @@ public final class SleepInhibitionSession {
     }
 
     public func heartbeat(client: UUID, uptime: TimeInterval) {
-        if owner == client && active { lastHeartbeat = uptime }
+        if owner == client && active { lastHeartbeat = max(lastHeartbeat, uptime) }
     }
 
     public func release(client: UUID) throws {

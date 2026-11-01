@@ -31,6 +31,19 @@ private final class SleepJournal: SleepInhibitionJournal {
 }
 
 struct SleepInhibitionTests {
+    @Test func queuedOlderHeartbeatDoesNotUndoNewerArrivalOrPreventExpiry() throws {
+        let driver = SleepDriver(), client = UUID(), inbox = LeaseHeartbeatInbox()
+        let session = try SleepInhibitionSession(driver: driver, journal: SleepJournal())
+        try session.enable(client: client, uptime: 10)
+        inbox.record(.sleep, at: 14)
+        session.heartbeat(client: client, uptime: try #require(inbox.latest(.sleep)))
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 18.9)
+        #expect(session.status.active)
+        session.tick(uptime: 19.1)
+        #expect(!session.status.active && !driver.state.disabled)
+    }
+
     @Test func partialWriteAndRecoveryFailureLeaveActionablePersistentDiagnostics() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

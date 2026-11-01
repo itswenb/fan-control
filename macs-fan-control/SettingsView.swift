@@ -117,6 +117,9 @@ struct MenuBarView: View {
                 MenuBarReadings()
             }
             if store.connectionError != nil { Label(store.text("硬件连接异常", "Hardware connection issue"), systemImage: "exclamationmark.circle").foregroundStyle(.orange) }
+            if let message = store.fanSafetyMessage {
+                Label(message, systemImage: "fan.fill").font(.caption).foregroundStyle(.orange)
+            }
             Divider()
             HStack {
             Menu(store.activePresetName) {

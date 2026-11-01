@@ -4,10 +4,13 @@ import FanHardware
 
 /// 电源命令不占用风扇执行器。 / Power commands never block the fan-control actor.
 actor SleepWorker {
+    private let executor = BlockingSerialExecutor(label: "com.itswenb.fancontrol.sleep-worker")
+    nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
     private let diagnostics: SleepDiagnosticLog
     init(diagnostics: SleepDiagnosticLog = .helper) { self.diagnostics = diagnostics }
     private var session: SleepInhibitionSession?
     private var initializationError: String?
+    private var ownerHeartbeat: (@Sendable () -> TimeInterval?)?
 
     private func initialize() {
         guard session == nil else { return }
@@ -21,7 +24,8 @@ actor SleepWorker {
         }
     }
 
-    func request(_ operation: HelperRequest.Operation, client: UUID, isOpen: @Sendable () -> Bool) -> HelperReply {
+    func request(_ operation: HelperRequest.Operation, client: UUID, isOpen: @Sendable () -> Bool,
+                 receivedAt: TimeInterval? = nil, latestHeartbeat: @escaping @Sendable () -> TimeInterval? = { nil }) -> HelperReply {
         initialize()
         var reply = HelperReply(available: false)
         if operation == .sleepDiagnostics {
@@ -45,7 +49,8 @@ actor SleepWorker {
                 if !isOpen() { session.disconnected(client: client); throw SleepInhibitionError.unconfirmed }
                 // 确认成功后开始租约，避免慢速写入消耗心跳窗口。 / Start the lease after a confirmed slow write.
                 session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
-            case .sleepHeartbeat: session.heartbeat(client: client, uptime: uptime)
+                ownerHeartbeat = latestHeartbeat
+            case .sleepHeartbeat: session.heartbeat(client: client, uptime: receivedAt ?? uptime)
             case .sleepDisable: try session.release(client: client)
             case .prepareUninstall: try session.prepareRemoval(client: client)
             case .cancelUninstall: session.cancelRemoval(client: client)
@@ -65,8 +70,15 @@ actor SleepWorker {
     func tick() {
         initialize()
         let state = ProcessInfo.processInfo.thermalState
+        if let session, let owner = session.status.owner, let heartbeat = ownerHeartbeat?() {
+            session.heartbeat(client: owner, uptime: heartbeat)
+        }
         session?.tick(uptime: ProcessInfo.processInfo.systemUptime, thermalEmergency: state == .serious || state == .critical)
+        if session?.status.owner == nil { ownerHeartbeat = nil }
     }
 
-    func disconnected(_ client: UUID) { session?.disconnected(client: client) }
+    func disconnected(_ client: UUID) {
+        if session?.status.owner == client { ownerHeartbeat = nil }
+        session?.disconnected(client: client)
+    }
 }

@@ -165,7 +165,7 @@ struct ControlSamplingTests {
         #expect(smc.reopens == 1)
     }
 
-    @Test func slowSamplingRestoresControlWithoutRetryingStaleReadings() throws {
+    @Test func slowSamplingHoldsMaximumUntilFreshReadingsReturn() throws {
         let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
         var clock: TimeInterval = 0
         let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
@@ -178,9 +178,22 @@ struct ControlSamplingTests {
         smc.onRead = { key in if key == "Tp09" { clock = 4 } }
         session.heartbeat(client: client, uptime: 11)
         session.tick(uptime: 11, now: Date())
-        #expect(session.status.owner == nil && session.status.recoveryReason == .samplingInterrupted)
+        #expect(session.status.owner == client && session.status.message?.contains("暂时全速") == true)
         #expect(smc.reopens == 0 && smc.reads.filter { $0 == "Tp09" }.count == 1)
-        #expect(smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty)
+        #expect(smc.values["F0md"]?.bytes == [1] && journal.fans == ["F0"])
+        #expect(smc.number("F0Tg") == 6_000)
+        smc.onRead = nil
+        smc.set("Tp09", 50)
+        session.heartbeat(client: client, uptime: 12)
+        session.tick(uptime: 12, now: Date())
+        #expect(session.status.owner == client && session.status.message == nil)
+        #expect(smc.number("F0Tg") == 6_000)
+        session.heartbeat(client: client, uptime: 13)
+        session.tick(uptime: 13, now: Date())
+        #expect(smc.number("F0Tg") == 6_000)
+        session.heartbeat(client: client, uptime: 14)
+        session.tick(uptime: 14, now: Date())
+        #expect((smc.number("F0Tg") ?? 6_000) < 6_000)
     }
 
     @Test func slowFanReadSkipsTemperatureSampling() throws {
@@ -197,6 +210,43 @@ struct ControlSamplingTests {
             Issue.record("Unexpected error: \(error)")
         }
         #expect(!smc.reads.contains("Tp01") && smc.reopens == 0 && smc.writes.isEmpty)
+    }
+
+    @Test func slowFallbackRestoresAutomaticAndMayResumeAfterConfirmation() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        var clock: TimeInterval = 0
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        let session = try ControlSession(driver: device, journal: journal)
+        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        smc.writes = []
+        smc.onRead = { key in
+            if key == "Tp01" { clock = 4 }
+            else if key == "FNum" && clock >= 4 { clock = 8 }
+        }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date())
+        #expect(session.status.owner == nil && session.status.recoveryReason == .samplingInterrupted)
+        #expect(session.status.recoveryReason?.permitsAutomaticResume == true)
+        #expect(!session.status.recoveryBlocked && journal.fans.isEmpty)
+        #expect(smc.values["F0md"]?.bytes == [0] && smc.writes == ["F0md", "F0Tg"])
+    }
+
+    @Test func disconnectDuringSlowSamplingNeverStartsMaximumFallback() throws {
+        let smc = MemorySMC(), journal = SamplingJournal(), client = UUID()
+        var clock: TimeInterval = 0, connected = true
+        let device = SMCDevice(allowWrites: true, connection: smc, monitoringTemperatures: { _ in [] }, uptime: { clock })
+        let session = try ControlSession(driver: device, journal: journal)
+        let source = ControlTemperatureSource(id: "Tp01", group: .cpu, keys: ["Tp01"])
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: source.id, low: 40, high: 80)
+        try session.apply([policy], temperatureSources: [source], client: client, uptime: 10, now: Date())
+        smc.writes = []
+        smc.onRead = { key in if key == "Tp01" { clock = 4; connected = false } }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: Date(), ownerConnected: { connected })
+        #expect(session.status.owner == nil && session.status.recoveryReason == .disconnected)
+        #expect(smc.values["F0md"]?.bytes == [0] && smc.writes == ["F0md", "F0Tg"] && journal.fans.isEmpty)
     }
 
     @Test func slowRPMReadSkipsRemainingFanReads() throws {
@@ -244,14 +294,14 @@ struct ControlSamplingTests {
                     smc.onRead = { key in if key == "Tp01" { Thread.sleep(forTimeInterval: 3.1) } }
                     session.heartbeat(client: client, uptime: 11)
                     session.tick(uptime: 11, now: Date())
-                    continuation.resume(returning: (session.status.recoveryReason == .samplingInterrupted && session.status.owner == nil,
-                                                    smc.values["F0md"]?.bytes == [0] && journal.fans.isEmpty, smc.writes))
+                    continuation.resume(returning: (session.status.owner == client && session.status.message?.contains("暂时全速") == true,
+                                                    smc.number("F0Tg") == 6_000 && journal.fans == ["F0"], smc.writes))
                 } catch { continuation.resume(throwing: error) }
             }
         }
         #expect(result.0)
         #expect(result.1)
-        #expect(result.2 == ["F0md", "F0Tg"])
+        #expect(result.2 == ["F0Tg"])
     }
 
     @Test func temporarilyUnavailableKeyAfterPowerRecoveryIsNotCachedForever() throws {

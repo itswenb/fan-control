@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import IOKit
 import SiliconScopeCore
 #if SWIFT_PACKAGE
@@ -29,8 +30,10 @@ private final class SMCConnection: SMCTransport {
     private var port: io_connect_t = 0
     private var metadata: [String: (size: Int, type: String)] = [:]
     private var unavailableKeys = Set<String>()
+    private let diagnostics: SleepDiagnosticLog?
 
-    init() throws {
+    init(diagnostics: SleepDiagnosticLog? = nil) throws {
+        self.diagnostics = diagnostics
         try reopen()
     }
 
@@ -60,9 +63,21 @@ private final class SMCConnection: SMCTransport {
         for (index, byte) in payload.enumerated() { input[48 + index] = byte }
         var output = [UInt8](repeating: 0, count: 80)
         var outputSize = 80
+        let started = diagnostics == nil ? 0 : ProcessInfo.processInfo.systemUptime
+        var cpuStart = timespec()
+        let haveCPUStart = diagnostics != nil && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuStart) == 0
         let result = input.withUnsafeBytes { source in
             output.withUnsafeMutableBytes { destination in
                 IOConnectCallStructMethod(port, 2, source.baseAddress, 80, destination.baseAddress, &outputSize)
+            }
+        }
+        if let diagnostics {
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed >= 0.5 {
+                var cpuEnd = timespec()
+                let cpu = haveCPUStart && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuEnd) == 0
+                    ? Double(cpuEnd.tv_sec - cpuStart.tv_sec) + Double(cpuEnd.tv_nsec - cpuStart.tv_nsec) / 1_000_000_000 : -1
+                diagnostics.event("smc", "call.slow", "command=\(command) key=\(SMCCodec.string(key)) elapsed=\(elapsed) threadCPU=\(cpu) result=\(result)", error: true)
             }
         }
         guard result == KERN_SUCCESS else { throw HardwareError.command(result, 0) }
@@ -270,7 +285,7 @@ public final class SMCDevice: FanControlDriver {
     }
 
     private func openConnection() throws -> any SMCTransport {
-        if connection == nil { connection = try SMCConnection() }
+        if connection == nil { connection = try SMCConnection(diagnostics: allowWrites ? .helper : nil) }
         guard let connection else { throw HardwareError.unavailable }
         return connection
     }
@@ -378,6 +393,8 @@ public final class SMCDevice: FanControlDriver {
 }
 
 public actor SMCReader {
+    private let executor = BlockingSerialExecutor(label: "com.itswenb.fancontrol.monitor-worker")
+    public nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
     private let device = SMCDevice()
     public init() {}
     public func reset() { device.reset() }

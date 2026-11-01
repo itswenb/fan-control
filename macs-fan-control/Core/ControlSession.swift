@@ -67,6 +67,7 @@ public final class ControlSession {
     private var retriesRemaining = 0
     private var journalFailure = false
     private var removalOwner: UUID?
+    private var samplingFallback = false
     public var preparingRemoval: Bool { removalOwner != nil }
     public var status: SessionStatus {
         SessionStatus(owner: owner, policies: policies, pendingRecovery: pending.sorted(), message: message,
@@ -81,7 +82,7 @@ public final class ControlSession {
 
     public func heartbeat(client: UUID, uptime: TimeInterval) {
         guard client == owner else { return }
-        lastHeartbeat = uptime
+        lastHeartbeat = max(lastHeartbeat, uptime)
     }
 
     public func apply(_ requested: [FanPolicy], temperatureSources: [ControlTemperatureSource] = [],
@@ -116,6 +117,7 @@ public final class ControlSession {
         lastHeartbeat = uptime
         message = nil
         recoveryReason = nil
+        samplingFallback = false
         do {
             for id in touched.subtracting(toControl) { try driver.restoreAutomatic(fanID: id) }
             touched = toControl
@@ -130,7 +132,8 @@ public final class ControlSession {
         }
     }
 
-    public func tick(uptime: TimeInterval, now: Date, thermalEmergency: Bool = false) {
+    public func tick(uptime: TimeInterval, now: Date, thermalEmergency: Bool = false,
+                     ownerConnected: () -> Bool = { true }) {
         if !pending.isEmpty || journalFailure {
             if retriesRemaining > 0 { retriesRemaining -= 1; retryRecovery() }
             return
@@ -152,8 +155,19 @@ public final class ControlSession {
             try PolicyValidator.validate(policies, in: snapshot, at: max(now, snapshot.timestamp))
             try verifyOwnership(in: snapshot)
             try update(snapshot: snapshot, now: now)
+            if samplingFallback { samplingFallback = false; message = nil }
         } catch ControlError.samplingInterrupted {
-            recover(reason: ControlError.samplingInterrupted.localizedDescription, cause: .samplingInterrupted)
+            guard policies.contains(where: { $0.mode == .sensor }) else {
+                recover(reason: ControlError.samplingInterrupted.localizedDescription, cause: .samplingInterrupted)
+                return
+            }
+            do { try holdMaximumForDelayedSampling(ownerConnected: ownerConnected) }
+            catch SessionError.notOwner { recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected) }
+            catch ControlError.samplingInterrupted {
+                let cause: RecoveryReason = ownerConnected() ? .samplingInterrupted : .disconnected
+                recover(reason: "温度采样延迟且全速保护未确认，恢复系统自动。", cause: cause)
+            }
+            catch { recover(reason: "温度采样延迟且全速保护未确认：\(error.localizedDescription)") }
         } catch { recover(reason: error.localizedDescription) }
     }
 
@@ -207,8 +221,33 @@ public final class ControlSession {
         }
     }
 
+    /// 温度延迟时仅在控制权和范围均可确认的情况下保持最高散热。 / Keep maximum cooling only when ownership and ranges are confirmed.
+    private func holdMaximumForDelayedSampling(ownerConnected: () -> Bool) throws {
+        guard ownerConnected() else { throw SessionError.notOwner }
+        let snapshot = try driver.controlSnapshot(temperatureSources: [])
+        guard ownerConnected() else { throw SessionError.notOwner }
+        try verifyOwnership(in: snapshot)
+        for id in touched.sorted() {
+            guard ownerConnected(), let fan = snapshot.fans.first(where: { $0.id == id }),
+                  fan.isFresh(at: Date()), fan.controlSupported, let maximum = fan.validRange?.upperBound else {
+                throw ControlError.invalidRange
+            }
+            if confirmedTargets[id] != maximum {
+                try driver.setTarget(fanID: id, rpm: maximum)
+                guard ownerConnected() else { throw SessionError.notOwner }
+                confirmedTargets[id] = maximum
+            }
+            var ramp = RampState()
+            _ = ramp.update(target: maximum, sampleTime: Date())
+            ramps[id] = ramp
+        }
+        samplingFallback = true
+        message = "温度采样延迟，风扇暂时全速散热；读数恢复后继续原策略。"
+    }
+
     private func recover(reason: String, cause: RecoveryReason = .controlFailure) {
         policies = []; temperatureSources = []; ramps = [:]; confirmedTargets = [:]; message = reason
+        samplingFallback = false
         recoveryReason = cause
         pending.formUnion(touched)
         retriesRemaining = 4
