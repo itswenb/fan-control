@@ -23,17 +23,22 @@ private final class FakeSleepService: ControlServiceConnection {
     var failAfterEnable = false
     var failDisable = false
     var heartbeats = 0
+    var recoveryReason: SleepRecoveryReason?
+    var holdEnable = false
+    var enableContinuation: CheckedContinuation<Void, Never>?
     var operations: [HelperRequest.Operation] = []
     let client = UUID()
     func register() async throws { installed = true }
     func unregister(connectionFailed: Bool) async throws { installed = false }
-    func disconnect() { active = false; onDisconnect?() }
+    func disconnect() { active = false; recoveryReason = .disconnected; onDisconnect?() }
     func request(_ request: HelperRequest) async throws -> HelperReply {
         operations.append(request.operation)
         switch request.operation {
         case .sleepEnable:
+            if holdEnable { await withCheckedContinuation { enableContinuation = $0 } }
             if ownedByAnotherClient { throw SleepInhibitionError.busy }
             active = true
+            recoveryReason = nil
             if failAfterEnable { throw HelperClientError.timeout }
         case .sleepDisable:
             if ownedByAnotherClient { throw SleepInhibitionError.busy }
@@ -43,7 +48,7 @@ private final class FakeSleepService: ControlServiceConnection {
         default: break
         }
         var reply = HelperReply(available: false)
-        reply.sleepStatus = SleepInhibitionStatus(available: true, owner: active ? client : nil, active: active)
+        reply.sleepStatus = SleepInhibitionStatus(available: true, owner: active ? client : nil, active: active, recoveryReason: recoveryReason)
         if request.operation == .sleepDiagnostics { reply.sleepDiagnostics = "persisted helper: restore.failed code=42" }
         reply.ownsSession = active && !ownedByAnotherClient
         return reply
@@ -157,7 +162,7 @@ struct SleepControllerTests {
         #expect(controller.message != nil)
     }
 
-    @Test func disconnectReconcilesWithoutReacquiringLease() async throws {
+    @Test func disconnectReacquiresLeaseAfterConfirmedRecovery() async throws {
         let service = FakeSleepService(), lights = FakeSleepLights()
         let controller = SleepInhibitionController(helper: service, lights: lights)
         service.onDisconnect = { controller.disconnected() }
@@ -166,8 +171,64 @@ struct SleepControllerTests {
         #expect(controller.phase == .unknown)
         controller.start()
         defer { controller.stop() }
+        try await waitUntil { controller.phase == .on && service.operations.filter { $0 == .sleepEnable }.count == 2 }
+        #expect(service.active && lights.failure != nil)
+    }
+
+    @Test func safetyRecoveryNeverReacquiresLease() async throws {
+        let service = FakeSleepService(), lights = FakeSleepLights()
+        let controller = SleepInhibitionController(helper: service, lights: lights)
+        service.onDisconnect = { controller.disconnected() }
+        try await controller.setEnabled(true)
+        service.disconnect()
+        service.recoveryReason = .safety
+        controller.start()
+        defer { controller.stop() }
         try await waitUntil { controller.phase == .off }
-        #expect(service.operations.filter { $0 == .sleepEnable }.count == 1)
+        #expect(!service.active && service.operations.filter { $0 == .sleepEnable }.count == 1)
+    }
+
+    @Test func serviceRestartDoesNotRetryAnUnknownPriorSafetyFailure() async throws {
+        let service = FakeSleepService(), lights = FakeSleepLights()
+        let controller = SleepInhibitionController(helper: service, lights: lights)
+        service.onDisconnect = { controller.disconnected() }
+        try await controller.setEnabled(true)
+        service.disconnect()
+        service.recoveryReason = .serviceRestarted
+        controller.start()
+        defer { controller.stop() }
+        try await waitUntil { controller.phase == .off }
+        #expect(!service.active && service.operations.filter { $0 == .sleepEnable }.count == 1)
+    }
+
+    @Test func expiredLeaseResumesWhenConnectionRemainsOpen() async throws {
+        let service = FakeSleepService(), lights = FakeSleepLights()
+        let controller = SleepInhibitionController(helper: service, lights: lights)
+        controller.start()
+        defer { controller.stop() }
+        try await controller.setEnabled(true)
+        try await waitUntil { service.heartbeats > 0 }
+        service.active = false
+        service.recoveryReason = .heartbeatExpired
+        try await waitUntil { service.operations.filter { $0 == .sleepEnable }.count == 2 && controller.phase == .on }
+        #expect(service.active)
+    }
+
+    @Test func userDisableDuringAutomaticReenableWins() async throws {
+        let service = FakeSleepService(), lights = FakeSleepLights()
+        let controller = SleepInhibitionController(helper: service, lights: lights)
+        service.onDisconnect = { controller.disconnected() }
+        try await controller.setEnabled(true)
+        service.disconnect()
+        service.holdEnable = true
+        controller.start()
+        defer { controller.stop() }
+        try await waitUntil { service.enableContinuation != nil }
+        let disable = Task { try await controller.setEnabled(false) }
+        await Task.yield()
+        service.enableContinuation?.resume(); service.enableContinuation = nil
+        try await disable.value
+        #expect(!service.active && controller.phase == .off)
     }
 
     @Test func fanDisconnectDoesNotEndIndependentSleepLease() async throws {
@@ -189,7 +250,7 @@ struct SleepControllerTests {
         #expect(sleepService.active && store.sleepControl.phase == .on && lights.failure != nil)
         sleepService.disconnect()
         #expect(store.sleepControl.phase == .unknown)
-        try await waitUntil { store.sleepControl.phase == .off }
-        #expect(sleepService.operations.filter { $0 == .sleepEnable }.count == 1)
+        try await waitUntil { store.sleepControl.phase == .on && sleepService.operations.filter { $0 == .sleepEnable }.count == 2 }
+        #expect(sleepService.active)
     }
 }

@@ -20,6 +20,7 @@ final class SleepInhibitionController {
     @ObservationIgnored private var revision = 0
     @ObservationIgnored private let diagnostics: SleepDiagnosticLog?
     @ObservationIgnored private var lastCheckpoint: TimeInterval = 0
+    @ObservationIgnored private var resumeAfterDisconnect = false
 
     init(helper: any ControlServiceConnection, lights: any LidBacklightManaging = LidBacklightController(), diagnostics: SleepDiagnosticLog? = nil) {
         self.helper = helper; self.lights = lights; self.diagnostics = diagnostics
@@ -41,9 +42,11 @@ final class SleepInhibitionController {
         task?.cancel(); task = nil
         revision += 1
         disconnected()
+        resumeAfterDisconnect = false
     }
 
     func disconnected() {
+        if phase == .on { resumeAfterDisconnect = true }
         revision += 1
         if needsRelease {
             if phase != .unknown { diagnostics?.event("app", "xpc.disconnected", "phase=\(phase)", error: true) }
@@ -55,6 +58,10 @@ final class SleepInhibitionController {
     }
 
     func setEnabled(_ enabled: Bool) async throws {
+        if !enabled {
+            resumeAfterDisconnect = false
+            while pending { try await Task.sleep(for: .milliseconds(50)) }
+        }
         guard !pending else { return }
         revision += 1
         let expected = revision
@@ -111,6 +118,7 @@ final class SleepInhibitionController {
     }
 
     func release() async throws {
+        resumeAfterDisconnect = false
         while pending { try await Task.sleep(for: .milliseconds(50)) }
         if needsRelease { try await setEnabled(false) }
     }
@@ -148,6 +156,7 @@ final class SleepInhibitionController {
             }
             status = state
             if state.active && !reply.ownsSession {
+                resumeAfterDisconnect = false
                 phase = .off
                 message = "防休眠会话由另一连接持有。"
                 try await lights.stop()
@@ -155,12 +164,25 @@ final class SleepInhibitionController {
                 return
             }
             if phase == .unknown, reply.ownsSession && state.active {
-                try await setEnabled(false)
+                if resumeAfterDisconnect {
+                    resumeAfterDisconnect = false
+                    try await setEnabled(true)
+                } else {
+                    try await setEnabled(false)
+                }
                 return
             }
             if !state.active && !state.recoveryPending {
                 let wasOn = phase != .off
+                // 重启后的日志不保留故障原因；A restarted service cannot prove the prior recovery was safe to retry.
+                let mayResume = (resumeAfterDisconnect || phase == .on) && (state.recoveryReason == .disconnected ||
+                    state.recoveryReason == .heartbeatExpired)
                 phase = .off
+                resumeAfterDisconnect = false
+                if mayResume {
+                    try await setEnabled(true)
+                    return
+                }
                 if wasOn {
                     try await lights.stop()
                     message = state.message

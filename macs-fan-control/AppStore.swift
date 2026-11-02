@@ -877,7 +877,7 @@ final class AppStore {
     }
 
     func setSleepInhibition(_ enabled: Bool) {
-        guard !helperInstalling, !sleepControl.pending else { return }
+        guard !helperInstalling, !sleepControl.pending || !enabled else { return }
         sleepActionError = nil
         Task {
             do {

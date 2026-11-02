@@ -217,6 +217,12 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
         let valid = request?.version == HelperConstants.protocolVersion && (request?.policies.count ?? 17) <= 16
         if valid, request?.operation == .heartbeat { connection.inbox.record(.fan, at: receivedAt) }
         if valid, request?.operation == .sleepHeartbeat { connection.inbox.record(.sleep, at: receivedAt) }
+        if valid, request?.operation == .sleepHeartbeat,
+           let cached = connection.inbox.recentSleepReply(at: receivedAt),
+           let data = try? JSONEncoder().encode(cached) {
+            reply(data)
+            return
+        }
         if valid, request?.operation == .heartbeat,
            let cached = connection.inbox.recentFanReply(at: receivedAt),
            let data = try? JSONEncoder().encode(cached) {
@@ -228,7 +234,7 @@ private final class Endpoint: NSObject, FanHelperProtocol, Sendable {
             if valid, let request, request.operation.isSleepOperation {
                 let response = await worker.sleepWorker.request(request.operation, client: connection.id,
                     isOpen: { self.connection.isOpen }, receivedAt: receivedAt,
-                    latestHeartbeat: { self.connection.inbox.latest(.sleep) })
+                    latestHeartbeat: { self.connection.inbox.latest(.sleep) }, inbox: self.connection.inbox)
                 reply((try? JSONEncoder().encode(response)) ?? Data())
             } else {
                 reply(await worker.request(data, connection: connection, receivedAt: receivedAt))

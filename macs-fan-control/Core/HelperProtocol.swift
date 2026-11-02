@@ -5,6 +5,7 @@ public enum HelperConstants {
     public static let appIdentifier = "com.itswenb.fancontrol"
     public static let plistName = machService + ".plist"
     public static let protocolVersion = 4
+    public static let leaseTimeout: TimeInterval = 15
     public static let installedHelperPath = "/Library/PrivilegedHelperTools/" + machService
     public static let daemonPath = "/Library/LaunchDaemons/" + plistName
     public static let supportPath = "/Library/Application Support/FanControl-helper"

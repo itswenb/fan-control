@@ -9,6 +9,8 @@ public final class LeaseHeartbeatInbox: @unchecked Sendable {
     private var sleep: TimeInterval?
     private var fanReply: HelperReply?
     private var fanReplyTime: TimeInterval = 0
+    private var sleepReply: HelperReply?
+    private var sleepReplyTime: TimeInterval = 0
 
     public init() {}
     public var isOpen: Bool { lock.withLock { open } }
@@ -45,6 +47,24 @@ public final class LeaseHeartbeatInbox: @unchecked Sendable {
         lock.withLock {
             guard open, uptime.isFinite, uptime >= fanReplyTime, uptime - fanReplyTime <= 15 else { return nil }
             return fanReply
+        }
+    }
+
+    /// 电源状态只来自已完成的检查；Power status expires if its worker stops progressing.
+    public func publishSleepReply(_ reply: HelperReply, at uptime: TimeInterval) {
+        lock.withLock {
+            guard open, uptime.isFinite, uptime >= 0 else { return }
+            sleepReply = reply
+            sleepReplyTime = uptime
+        }
+    }
+
+    public func invalidateSleepReply() { lock.withLock { sleepReply = nil } }
+
+    public func recentSleepReply(at uptime: TimeInterval) -> HelperReply? {
+        lock.withLock {
+            guard open, uptime.isFinite, uptime >= sleepReplyTime, uptime - sleepReplyTime <= 15 else { return nil }
+            return sleepReply
         }
     }
 }

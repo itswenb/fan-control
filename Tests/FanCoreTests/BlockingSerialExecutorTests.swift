@@ -60,7 +60,7 @@ private actor FanLeaseProbe {
     }
 
     func expire() -> Bool {
-        session.tick(uptime: 19.1, now: Date())
+        session.tick(uptime: 29.1, now: Date())
         return session.status.owner == nil && session.status.recoveryReason == .heartbeatExpired
     }
 }

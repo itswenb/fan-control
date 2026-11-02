@@ -31,6 +31,19 @@ private final class SleepJournal: SleepInhibitionJournal {
 }
 
 struct SleepInhibitionTests {
+    @Test func disconnectCannotReplacePendingThermalRecoveryWithRetryableCause() throws {
+        let driver = SleepDriver(), journal = SleepJournal(), client = UUID()
+        let session = try SleepInhibitionSession(driver: driver, journal: journal)
+        try session.enable(client: client, uptime: 10)
+        driver.failRestore = true
+        session.tick(uptime: 11, thermalEmergency: true)
+        #expect(session.status.recoveryPending && session.status.recoveryReason == .safety)
+        session.disconnected(client: client)
+        #expect(session.status.recoveryReason == .safety)
+        driver.failRestore = false
+        session.tick(uptime: 20)
+        #expect(!session.status.recoveryPending && session.status.recoveryReason == .safety)
+    }
     @Test func queuedOlderHeartbeatDoesNotUndoNewerArrivalOrPreventExpiry() throws {
         let driver = SleepDriver(), client = UUID(), inbox = LeaseHeartbeatInbox()
         let session = try SleepInhibitionSession(driver: driver, journal: SleepJournal())
@@ -40,7 +53,7 @@ struct SleepInhibitionTests {
         session.heartbeat(client: client, uptime: 11)
         session.tick(uptime: 18.9)
         #expect(session.status.active)
-        session.tick(uptime: 19.1)
+        session.tick(uptime: 29.1)
         #expect(!session.status.active && !driver.state.disabled)
     }
 
@@ -68,7 +81,7 @@ struct SleepInhibitionTests {
         #expect(throws: SleepInhibitionError.self) { try session.enable(client: stranger, uptime: 11) }
         #expect(throws: SleepInhibitionError.self) { try session.release(client: stranger) }
         session.heartbeat(client: stranger, uptime: 15)
-        session.tick(uptime: 15.1)
+        session.tick(uptime: 25.1)
         #expect(!session.status.active && !journal.pending && !driver.state.disabled)
         #expect(driver.writes == [true, false])
     }

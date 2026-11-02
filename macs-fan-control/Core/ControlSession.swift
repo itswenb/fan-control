@@ -143,7 +143,7 @@ public final class ControlSession {
             recover(reason: "系统热压力过高，恢复系统控制。", cause: .thermalEmergency)
             return
         }
-        if uptime - lastHeartbeat > 5 {
+        if uptime - lastHeartbeat > HelperConstants.leaseTimeout {
             let gap = String(format: "%.1f", uptime - lastHeartbeat)
             recover(reason: "客户端心跳超时（\(gap) 秒），恢复系统控制。", cause: .heartbeatExpired)
             return

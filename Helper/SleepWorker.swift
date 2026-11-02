@@ -11,6 +11,17 @@ actor SleepWorker {
     private var session: SleepInhibitionSession?
     private var initializationError: String?
     private var ownerHeartbeat: (@Sendable () -> TimeInterval?)?
+    private var ownerInbox: LeaseHeartbeatInbox?
+    private var ownerID: UUID?
+
+    private func publishOwnerStatus() {
+        guard let session, let inbox = ownerInbox, let ownerID else { return }
+        var reply = HelperReply(available: false)
+        reply.sleepStatus = session.status
+        reply.ownsSession = session.status.owner == ownerID
+        inbox.publishSleepReply(reply, at: ProcessInfo.processInfo.systemUptime)
+        if session.status.owner != ownerID { ownerInbox = nil; self.ownerID = nil }
+    }
 
     private func initialize() {
         guard session == nil else { return }
@@ -25,8 +36,10 @@ actor SleepWorker {
     }
 
     func request(_ operation: HelperRequest.Operation, client: UUID, isOpen: @Sendable () -> Bool,
-                 receivedAt: TimeInterval? = nil, latestHeartbeat: @escaping @Sendable () -> TimeInterval? = { nil }) -> HelperReply {
+                 receivedAt: TimeInterval? = nil, latestHeartbeat: @escaping @Sendable () -> TimeInterval? = { nil },
+                 inbox: LeaseHeartbeatInbox? = nil) -> HelperReply {
         initialize()
+        if operation != .sleepStatus && operation != .sleepHeartbeat { inbox?.invalidateSleepReply() }
         var reply = HelperReply(available: false)
         if operation == .sleepDiagnostics {
             guard isOpen() else { reply.error = SleepInhibitionError.busy.localizedDescription; return reply }
@@ -50,6 +63,7 @@ actor SleepWorker {
                 // 确认成功后开始租约，避免慢速写入消耗心跳窗口。 / Start the lease after a confirmed slow write.
                 session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
                 ownerHeartbeat = latestHeartbeat
+                ownerInbox = inbox; ownerID = client
             case .sleepHeartbeat: session.heartbeat(client: client, uptime: receivedAt ?? uptime)
             case .sleepDisable: try session.release(client: client)
             case .prepareUninstall: try session.prepareRemoval(client: client)
@@ -64,6 +78,7 @@ actor SleepWorker {
         }
         reply.sleepStatus = session?.status ?? SleepInhibitionStatus(available: false, message: initializationError)
         reply.ownsSession = session?.status.owner == client
+        publishOwnerStatus()
         return reply
     }
 
@@ -74,11 +89,13 @@ actor SleepWorker {
             session.heartbeat(client: owner, uptime: heartbeat)
         }
         session?.tick(uptime: ProcessInfo.processInfo.systemUptime, thermalEmergency: state == .serious || state == .critical)
+        publishOwnerStatus()
         if session?.status.owner == nil { ownerHeartbeat = nil }
     }
 
     func disconnected(_ client: UUID) {
         if session?.status.owner == client { ownerHeartbeat = nil }
         session?.disconnected(client: client)
+        publishOwnerStatus()
     }
 }

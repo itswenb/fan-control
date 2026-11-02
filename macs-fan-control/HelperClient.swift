@@ -125,11 +125,12 @@ final class HelperClient: ControlServiceConnection {
         let connection = try connect()
         guard let connectionID else { throw HelperClientError.disconnected }
         let id = UUID()
-        let deadline = RequestDeadline(deadline: ProcessInfo.processInfo.systemUptime + 5)
+        let timeout: TimeInterval = request.operation == .heartbeat || request.operation == .sleepHeartbeat ? 15 : 5
+        let deadline = RequestDeadline(deadline: ProcessInfo.processInfo.systemUptime + timeout)
         let response: HelperReply = try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             timeouts[id] = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
                 guard self?.pending[id] != nil else { return }
                 guard !deadline.hasTimelyReply else { return }
                 self?.diagnostics?.event("xpc", "request.timeout", "operation=\(request.operation.rawValue) connection=\(connectionID)", error: true)

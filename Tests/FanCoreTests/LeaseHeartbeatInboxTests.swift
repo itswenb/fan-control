@@ -31,4 +31,19 @@ struct LeaseHeartbeatInboxTests {
         inbox.publishFanReply(reply, at: 31)
         #expect(inbox.recentFanReply(at: 31) == nil)
     }
+
+    @Test func sleepHeartbeatCacheExpiresAndCannotSurviveConnectionClose() {
+        let inbox = LeaseHeartbeatInbox(), client = UUID()
+        var reply = HelperReply(available: false)
+        reply.sleepStatus = SleepInhibitionStatus(available: true, owner: client, active: true)
+        reply.ownsSession = true
+        inbox.publishSleepReply(reply, at: 10)
+        #expect(inbox.recentSleepReply(at: 16)?.sleepStatus?.owner == client)
+        #expect(inbox.recentSleepReply(at: 25.01) == nil)
+        inbox.invalidateSleepReply()
+        #expect(inbox.recentSleepReply(at: 16) == nil)
+        inbox.publishSleepReply(reply, at: 20)
+        inbox.close()
+        #expect(inbox.recentSleepReply(at: 20) == nil)
+    }
 }

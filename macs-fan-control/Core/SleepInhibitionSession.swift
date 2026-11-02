@@ -26,6 +26,10 @@ public protocol SleepInhibitionJournal: AnyObject {
     func save(needsRecovery: Bool) throws
 }
 
+public enum SleepRecoveryReason: String, Codable, Sendable {
+    case disconnected, heartbeatExpired, serviceRestarted, requested, safety
+}
+
 public struct SleepInhibitionStatus: Codable, Sendable {
     public var available: Bool
     public var owner: UUID?
@@ -33,11 +37,13 @@ public struct SleepInhibitionStatus: Codable, Sendable {
     public var recoveryPending: Bool
     public var externallyDisabled: Bool
     public var message: String?
+    public var recoveryReason: SleepRecoveryReason?
 
     public init(available: Bool, owner: UUID? = nil, active: Bool = false, recoveryPending: Bool = false,
-                externallyDisabled: Bool = false, message: String? = nil) {
+                externallyDisabled: Bool = false, message: String? = nil, recoveryReason: SleepRecoveryReason? = nil) {
         self.available = available; self.owner = owner; self.active = active
         self.recoveryPending = recoveryPending; self.externallyDisabled = externallyDisabled; self.message = message
+        self.recoveryReason = recoveryReason
     }
 
     public var diagnosticSummary: String {
@@ -72,12 +78,14 @@ public final class SleepInhibitionSession {
     private var lastHeartbeat: TimeInterval = 0
     private var nextRetry: TimeInterval = 0
     private var message: String?
+    private var recoveryReason: SleepRecoveryReason?
     private var latest: SleepPowerState?
 
     public var status: SleepInhibitionStatus {
         SleepInhibitionStatus(available: latest?.lidClosed != nil && !pending && removalOwner == nil,
                               owner: owner, active: active, recoveryPending: pending,
-                              externallyDisabled: latest?.disabled == true && owner == nil && !pending, message: message)
+                              externallyDisabled: latest?.disabled == true && owner == nil && !pending, message: message,
+                              recoveryReason: recoveryReason)
     }
 
     public init(driver: any SleepInhibitionDriver, journal: any SleepInhibitionJournal, diagnostics: SleepDiagnosticLog? = nil) throws {
@@ -85,7 +93,7 @@ public final class SleepInhibitionSession {
         self.diagnostics = diagnostics
         pending = try journal.load()
         diagnostics?.event("lease", "startup", "journalPending=\(pending)")
-        if pending { recover(reason: "服务重新启动，恢复上次睡眠设置。") }
+        if pending { recover(reason: "服务重新启动，恢复上次睡眠设置。", cause: .serviceRestarted) }
         latest = try? driver.read()
     }
 
@@ -116,7 +124,7 @@ public final class SleepInhibitionSession {
             let confirmed = try driver.read()
             guard confirmed.disabled else { throw SleepInhibitionError.unconfirmed }
             latest = confirmed
-            active = true; pending = false; lastHeartbeat = uptime; message = nil
+            active = true; pending = false; lastHeartbeat = uptime; message = nil; recoveryReason = nil
             diagnostics?.event("lease", "enable.confirmed", confirmed.diagnosticSummary)
         } catch {
             diagnostics?.event("lease", "enable.failed", SleepDiagnosticLog.describe(error), error: true)
@@ -131,20 +139,20 @@ public final class SleepInhibitionSession {
 
     public func release(client: UUID) throws {
         guard owner == nil || owner == client || pending else { throw SleepInhibitionError.busy }
-        if owner != nil || pending { recover(reason: "已恢复正常睡眠设置。") }
+        if owner != nil || pending { recover(reason: "已恢复正常睡眠设置。", cause: .requested) }
         guard !pending else { throw SleepInhibitionError.recoveryRequired }
     }
 
     public func tick(uptime: TimeInterval, thermalEmergency: Bool = false) {
         if pending {
-            if uptime >= nextRetry { nextRetry = uptime + 5; recover(reason: "已恢复正常睡眠设置。") }
+            if uptime >= nextRetry { nextRetry = uptime + 5; recover(reason: "已恢复正常睡眠设置。", cause: recoveryReason ?? .safety) }
             return
         }
         guard active else { latest = try? driver.read(); return }
         if thermalEmergency { recover(reason: "系统热压力过高，已结束防休眠。"); return }
-        if uptime - lastHeartbeat > 5 {
+        if uptime - lastHeartbeat > HelperConstants.leaseTimeout {
             diagnostics?.event("lease", "heartbeat.expired", "gap=\(uptime - lastHeartbeat)", error: true)
-            recover(reason: "客户端心跳超时，已结束防休眠。"); return
+            recover(reason: "客户端心跳超时，已结束防休眠。", cause: .heartbeatExpired); return
         }
         do {
             let state = try driver.read()
@@ -162,7 +170,7 @@ public final class SleepInhibitionSession {
     }
 
     public func disconnected(client: UUID) {
-        if owner == client { recover(reason: "客户端断开，已结束防休眠。") }
+        if owner == client && !pending { recover(reason: "客户端断开，已结束防休眠。", cause: .disconnected) }
         if removalOwner == client { removalOwner = nil }
     }
 
@@ -178,9 +186,9 @@ public final class SleepInhibitionSession {
         state.onBattery && (state.batteryPercent.map { !$0.isFinite || $0 <= 20 } ?? true)
     }
 
-    private func recover(reason: String) {
+    private func recover(reason: String, cause: SleepRecoveryReason = .safety) {
         diagnostics?.event("lease", "restore.begin", "client=\(owner?.uuidString ?? "none") reason=\(reason)")
-        active = false; pending = true; message = reason
+        active = false; pending = true; message = reason; recoveryReason = cause
         do {
             try driver.setDisabled(false)
             let state = try driver.read()

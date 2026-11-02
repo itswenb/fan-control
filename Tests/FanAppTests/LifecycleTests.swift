@@ -478,7 +478,7 @@ struct LifecycleTests {
         let preset = FanPreset(name: "编译", model: "test", source: .live, policies: [f.policy])
         f.store.presets = [preset]
         try await f.store.apply([f.policy], presetID: preset.id)
-        let uptime = ProcessInfo.processInfo.systemUptime + 6
+        let uptime = ProcessInfo.processInfo.systemUptime + 16
         f.service.session.tick(uptime: uptime, now: Date())
         #expect(f.driver.value.fans[0].mode == .automatic)
         f.store.start()
@@ -549,7 +549,7 @@ struct LifecycleTests {
         let f = try Fixture()
         defer { f.close() }
         try await f.store.apply([f.policy])
-        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 6, now: Date())
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 16, now: Date())
         f.store.restoreAutomatic()
         try await waitUntil { f.store.displayPolicies.isEmpty && !f.store.controlPending }
         f.store.start()
@@ -562,7 +562,7 @@ struct LifecycleTests {
         let f = try Fixture()
         defer { f.close() }
         try await f.store.apply([f.policy])
-        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 6, now: Date())
+        f.service.session.tick(uptime: ProcessInfo.processInfo.systemUptime + 16, now: Date())
         f.service.failApply = true
         f.store.start()
         try await waitUntil { f.store.alertMessage != nil }

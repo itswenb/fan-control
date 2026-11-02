@@ -107,7 +107,7 @@ struct SessionTests {
         session.heartbeat(client: client, uptime: 11)
         session.tick(uptime: 18.9, now: Date())
         #expect(session.status.owner == client)
-        session.tick(uptime: 19.1, now: Date())
+        session.tick(uptime: 29.1, now: Date())
         #expect(session.status.owner == nil && session.status.recoveryReason == .heartbeatExpired)
     }
 
@@ -216,7 +216,7 @@ struct SessionTests {
         let policies = [FanPolicy(fanID: "F0", mode: .fixed, rpm: 3_000)]
         try session.apply(policies, client: client, uptime: 10, now: now)
         #expect(throws: (any Error).self) { try session.apply(policies, client: UUID(), uptime: 11, now: now) }
-        session.tick(uptime: 16, now: now.addingTimeInterval(6))
+        session.tick(uptime: 26, now: now.addingTimeInterval(16))
         #expect(session.status.owner == nil)
         #expect(driver.restores == ["F0"])
         #expect(session.status.recoveryReason == .heartbeatExpired)
@@ -411,7 +411,7 @@ struct SessionTests {
         session.heartbeat(client: first, uptime: 20)
         session.disconnected(client: first)
         #expect(session.status.owner == second)
-        session.tick(uptime: 20, now: now.addingTimeInterval(9))
+        session.tick(uptime: 27, now: now.addingTimeInterval(16))
         #expect(session.status.owner == nil)
     }
 }
