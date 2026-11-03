@@ -123,9 +123,9 @@ struct SessionTests {
                     driver.onWrite = { id in if id == "F0" { Thread.sleep(forTimeInterval: 3.1) } }
                     var stale = false
                     do { try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: now) }
-                    catch ControlError.staleSensor { stale = true }
+                    catch SessionError.confirmedWriteStale { stale = true }
                     continuation.resume(returning: (stale, driver.writes, Set(driver.restores), journal.fans.isEmpty,
-                                                    session.status.owner == nil && session.status.recoveryReason == .controlFailure))
+                                                    session.status.owner == nil && session.status.recoveryReason == .postWriteStale))
                 } catch { continuation.resume(throwing: error) }
             }
         }
@@ -133,6 +133,116 @@ struct SessionTests {
         #expect(result.1 == ["F0"])
         #expect(result.2 == ["F0", "F1"] && result.3)
         #expect(result.4)
+    }
+
+    @Test func confirmedSlowWriteRestoresBothFansAndAllowsFreshRetry() throws {
+        let start = Date(), driver = FakeDriver(now: start), journal = MemoryJournal(), client = UUID()
+        var now = start
+        let session = try ControlSession(driver: driver, journal: journal, clock: { now })
+        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+        try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: start)
+        driver.writes = []
+        driver.value.sensors[0].celsius = 75
+        now = start.addingTimeInterval(1)
+        driver.value.sensors[0].sampledAt = now; driver.value.timestamp = now
+        driver.onWrite = { _ in now = start.addingTimeInterval(8.3) }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now)
+        #expect(driver.writes == ["F0"])
+        #expect(Set(driver.restores) == ["F0", "F1"] && journal.fans.isEmpty)
+        #expect(session.status.recoveryReason == .postWriteStale && !session.status.recoveryBlocked)
+        driver.onWrite = nil
+        driver.value.sensors[0].sampledAt = now
+        driver.value.timestamp = now
+        try session.apply(policies, temperatureSources: sources, client: client, uptime: 20, now: now)
+        #expect(session.status.owner == client && session.status.policies == policies)
+    }
+
+    @Test func slowConfirmedMaximumRetainsControlOnlyAfterFreshFanReadback() throws {
+        let start = Date(), driver = FakeDriver(now: start), client = UUID()
+        var now = start
+        let session = try ControlSession(driver: driver, journal: MemoryJournal(), clock: { now })
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: start)
+        driver.value.sensors[0].celsius = 90
+        now = start.addingTimeInterval(1)
+        driver.value.sensors[0].sampledAt = now; driver.value.timestamp = now
+        driver.onWrite = { _ in now = start.addingTimeInterval(8.3) }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now)
+        #expect(session.status.owner == client && driver.restores.isEmpty)
+        #expect(driver.value.fans[0].target == 6_000 && session.status.message?.contains("全速") == true)
+        #expect(driver.requestedSources.last == [])
+    }
+
+    @Test func failedSlowWriteIsNotClassifiedAsSafeToRetry() throws {
+        let start = Date(), driver = FakeDriver(now: start), client = UUID()
+        var now = start
+        let session = try ControlSession(driver: driver, journal: MemoryJournal(), clock: { now })
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: start)
+        driver.value.sensors[0].celsius = 75
+        driver.failWrite = "F0"
+        now = start.addingTimeInterval(1)
+        driver.value.sensors[0].sampledAt = now; driver.value.timestamp = now
+        driver.onWrite = { _ in now = start.addingTimeInterval(8.3) }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now)
+        #expect(session.status.recoveryReason == .controlFailure && session.status.recoveryReason?.permitsAutomaticResume == false)
+    }
+
+    @Test func unconfirmedAutomaticRecoveryBlocksRetryAfterConfirmedSlowWrite() throws {
+        let start = Date(), driver = FakeDriver(now: start), journal = MemoryJournal(), client = UUID()
+        var now = start
+        let session = try ControlSession(driver: driver, journal: journal, clock: { now })
+        let policies = ["F0", "F1"].map { FanPolicy(fanID: $0, mode: .sensor, sensorID: "T0", low: 40, high: 80) }
+        let sources = try ControlTemperatureSource.resolve(policies, in: driver.value)
+        driver.onWrite = { _ in now = start.addingTimeInterval(7.3) }
+        driver.failRestore = "F1"
+        #expect(throws: SessionError.confirmedWriteStale) {
+            try session.apply(policies, temperatureSources: sources, client: client, uptime: 10, now: start)
+        }
+        #expect(session.status.recoveryBlocked && journal.fans == ["F1"])
+        #expect(throws: SessionError.recoveryRequired) {
+            try session.apply(policies, temperatureSources: sources, client: client, uptime: 11, now: start)
+        }
+        driver.failRestore = nil
+        session.tick(uptime: 12, now: now)
+        #expect(!session.status.recoveryBlocked && session.status.recoveryReason == .postWriteStale && journal.fans.isEmpty)
+    }
+
+    @Test(arguments: [false, true])
+    func externalTakeoverDuringSlowMaximumIsNeverOverwritten(journalFails: Bool) throws {
+        let start = Date(), driver = FakeDriver(now: start), journal = MemoryJournal(), client = UUID()
+        var now = start
+        let session = try ControlSession(driver: driver, journal: journal, clock: { now })
+        let policy = FanPolicy(fanID: "F0", mode: .sensor, sensorID: "T0", low: 40, high: 80)
+        let sources = try ControlTemperatureSource.resolve([policy], in: driver.value)
+        try session.apply([policy], temperatureSources: sources, client: client, uptime: 10, now: start)
+        now = start.addingTimeInterval(1)
+        driver.value.sensors[0].celsius = 90
+        driver.value.sensors[0].sampledAt = now; driver.value.timestamp = now
+        driver.onWrite = { _ in now = start.addingTimeInterval(8.3) }
+        driver.onSnapshot = { sources in
+            if sources.isEmpty {
+                driver.value.fans[0].target = 4_000
+                journal.failSave = journalFails
+            }
+        }
+        session.heartbeat(client: client, uptime: 11)
+        session.tick(uptime: 11, now: now)
+        #expect(driver.restores.isEmpty && driver.value.fans[0].target == 4_000)
+        #expect(session.status.recoveryReason == .controlFailure)
+        if journalFails {
+            #expect(session.status.recoveryBlocked)
+            journal.failSave = false
+            session.tick(uptime: 12, now: now)
+        }
+        #expect(!session.status.recoveryBlocked && journal.fans.isEmpty && driver.restores.isEmpty)
+        driver.onSnapshot = nil
     }
 
     @Test func sensorPolicyKeepsOnlySelectedSourcesAndRejectsUnrelatedSourcesBeforeReading() throws {

@@ -145,7 +145,8 @@ private actor HelperWorker {
                     let state = ProcessInfo.processInfo.thermalState
                     guard state != .serious, state != .critical else { throw ControlError.readOnly }
                     try session.apply(request.policies, temperatureSources: request.temperatureSources,
-                                      client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
+                                      client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date(),
+                                      ownerConnected: { connection.isOpen })
                     // 写入确认后重新计时；断连期间完成写入时立即恢复。 / Renew after confirmation, or restore if disconnected.
                     guard connection.isOpen else { session.disconnected(client: client); throw SessionError.notOwner }
                     session.heartbeat(client: client, uptime: ProcessInfo.processInfo.systemUptime)
@@ -156,6 +157,9 @@ private actor HelperWorker {
             response.error = error.localizedDescription
             if let error = error as? SessionError, case .readingsNotReady = error {
                 response.readingsNotReady = true
+            }
+            if let error = error as? SessionError, case .confirmedWriteStale = error {
+                response.confirmedWriteStale = true
             }
         }
         response.status = session?.status

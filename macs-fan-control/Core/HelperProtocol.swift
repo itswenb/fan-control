@@ -46,6 +46,8 @@ public struct HelperReply: Codable, Sendable {
     public var error: String?
     /// 仅表示 apply 的写入前校验失败；旧服务没有此字段时按普通错误处理。
     public var readingsNotReady: Bool?
+    /// 已确认写入后读数过期，服务正回收控制。 / Confirmed write aged the sample; recovery is in progress.
+    public var confirmedWriteStale: Bool?
     public var ownsSession = false
     public var sleepStatus: SleepInhibitionStatus?
     public var sleepDiagnostics: String?

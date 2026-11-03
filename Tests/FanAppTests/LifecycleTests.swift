@@ -121,6 +121,11 @@ private final class MemoryService: ControlServiceConnection {
     var holdRestore = false
     var holdStatus = false
     var failApply = false
+    var confirmedStaleFailures = 0
+    var overrideRecoveryReason: RecoveryReason?
+    var holdApply = false
+    var applyContinuation: CheckedContinuation<Void, Never>?
+    var connectionRevision = 0
     var timeoutsBeforeApply = 0
     var timeoutsAfterApply = 0
     var onApplyTimeout: (() -> Void)?
@@ -140,12 +145,20 @@ private final class MemoryService: ControlServiceConnection {
     init(driver: MemoryDriver) throws { session = try ControlSession(driver: driver, journal: MemoryJournal()) }
     func register() async throws {}
     func unregister(connectionFailed: Bool) async throws {}
-    func disconnect() { disconnects += 1; session.disconnected(client: client); onDisconnect?() }
+    func disconnect() { connectionRevision += 1; disconnects += 1; session.disconnected(client: client); onDisconnect?() }
 
     func request(_ request: HelperRequest) async throws -> HelperReply {
         requests.append(request.operation)
         switch request.operation {
         case .apply:
+            let expectedConnection = connectionRevision
+            if holdApply { await withCheckedContinuation { applyContinuation = $0 } }
+            guard connectionRevision == expectedConnection else { throw HelperClientError.disconnected }
+            if confirmedStaleFailures > 0 {
+                confirmedStaleFailures -= 1
+                overrideRecoveryReason = .postWriteStale
+                throw HelperClientError.confirmedWriteStale
+            }
             if failApply { throw ControlError.invalidRPM }
             if timeoutsBeforeApply > 0 {
                 timeoutsBeforeApply -= 1
@@ -156,6 +169,7 @@ private final class MemoryService: ControlServiceConnection {
                 try session.apply(request.policies, temperatureSources: request.temperatureSources,
                                   client: client, uptime: ProcessInfo.processInfo.systemUptime, now: Date())
             } catch SessionError.readingsNotReady { throw HelperClientError.readingsNotReady }
+            overrideRecoveryReason = nil
             if timeoutsAfterApply > 0 {
                 timeoutsAfterApply -= 1
                 onApplyTimeout?()
@@ -169,7 +183,9 @@ private final class MemoryService: ControlServiceConnection {
             if holdStatus { await withCheckedContinuation { statusContinuation = $0 } }
         default: break
         }
-        var reply = HelperReply(available: true, status: session.status)
+        var currentStatus = session.status
+        if let overrideRecoveryReason { currentStatus.recoveryReason = overrideRecoveryReason }
+        var reply = HelperReply(available: true, status: currentStatus)
         reply.ownsSession = session.status.owner == client
         return reply
     }
@@ -200,6 +216,7 @@ private final class Fixture {
     func close() {
         store.stop()
         service.onApplyTimeout = nil
+        service.applyContinuation?.resume(); service.applyContinuation = nil
         reader.sampleContinuation?.resume(); reader.sampleContinuation = nil
         service.restoreContinuation?.resume(); service.restoreContinuation = nil
         while let continuation = service.statusContinuation {
@@ -216,6 +233,23 @@ struct LifecycleTests {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition(), "生命周期流程未在期限内完成")
+    }
+
+    @Test func userAutomaticCancelsApplyDuringControlSampling() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.store.setDetailedMonitoring(false)
+        f.store.snapshot?.fans[0].sampledAt = Date().addingTimeInterval(-10)
+        f.store.snapshot?.sensors[0].sampledAt = Date().addingTimeInterval(-10)
+        f.reader.holdSample = true
+        let attempt = Task { try await f.store.apply([f.policy]) }
+        try await waitUntil { f.reader.sampleContinuation != nil }
+        f.store.restoreAutomatic()
+        f.reader.holdSample = false
+        f.reader.sampleContinuation?.resume(); f.reader.sampleContinuation = nil
+        await #expect(throws: ControlError.self) { try await attempt.value }
+        try await waitUntil { !f.store.controlPending && f.service.requests.contains(.restore) }
+        #expect(f.service.applyCount == 0 && f.driver.value.fans[0].mode == .automatic)
     }
 
     @Test func blockedControlReadTimesOutWithoutLateWriteOrUnboundedRetries() async throws {
@@ -501,6 +535,47 @@ struct LifecycleTests {
         try await waitUntil { f.service.applyCount == 2 && !f.store.controlPending }
         #expect(f.service.session.status.policies == [f.policy])
         #expect(f.driver.value.fans[0].mode == .fixed)
+    }
+
+    @Test func initialConfirmedStaleWriteRetriesOnlyAfterRecovery() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.service.confirmedStaleFailures = 1
+        await #expect(throws: HelperClientError.self) { try await f.store.apply([f.policy]) }
+        #expect(f.store.recoveryUnconfirmed && f.service.applyCount == 1)
+        f.store.start()
+        try await waitUntil { f.service.applyCount == 2 && f.service.session.status.policies == [f.policy] }
+        #expect(f.driver.value.fans[0].mode == .fixed && !f.store.recoveryUnconfirmed)
+    }
+
+    @Test func postWriteStaleAutomaticRetryStopsAfterThreeAttempts() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.service.confirmedStaleFailures = 10
+        await #expect(throws: HelperClientError.self) { try await f.store.apply([f.policy]) }
+        f.store.start()
+        try await waitUntil(timeout: 18) { f.service.applyCount == 4 && f.store.alertMessage != nil }
+        let attempts = f.service.applyCount
+        try await Task.sleep(for: .seconds(2))
+        #expect(f.service.applyCount == attempts && f.driver.value.fans[0].mode == .automatic)
+    }
+
+    @Test func userAutomaticCancelsInFlightPostWriteRetry() async throws {
+        let f = try Fixture()
+        defer { f.close() }
+        f.service.confirmedStaleFailures = 1
+        await #expect(throws: HelperClientError.self) { try await f.store.apply([f.policy]) }
+        f.service.holdApply = true
+        f.store.start()
+        try await waitUntil { f.service.applyContinuation != nil }
+        f.store.restoreAutomatic()
+        f.service.holdApply = false
+        f.service.applyContinuation?.resume(); f.service.applyContinuation = nil
+        try await waitUntil { !f.store.controlPending && !f.store.recoveryUnconfirmed && f.service.requests.contains(.restore) }
+        #expect(f.driver.value.fans[0].mode == .automatic && f.store.displayPolicies.isEmpty)
+        let attempts = f.service.applyCount
+        try await Task.sleep(for: .seconds(2))
+        #expect(f.service.applyCount == attempts)
     }
 
     @Test func delayedFullSpeedCheckDoesNotRestoreAutomaticOrReapply() async throws {

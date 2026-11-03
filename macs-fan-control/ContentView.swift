@@ -144,7 +144,7 @@ private struct MainFooter: View {
                 .foregroundStyle(Color.primary)
                 .padding(.horizontal, 14).frame(height: 30)
                 .glassControl(radius: 9)
-                .disabled(store.controlPending || store.hardwareOverview?.hasFans != true)
+                .disabled(store.hardwareOverview?.hasFans != true)
             Button { store.showDiagnostics = true } label: {
                 Image(systemName: "info.circle").frame(width: 32, height: 30).glassControl(radius: 9)
             }.buttonStyle(.plain).help(store.text("连接诊断", "Connection diagnostics"))

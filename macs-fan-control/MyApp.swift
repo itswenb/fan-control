@@ -109,7 +109,7 @@ private final class MenuIconOverlay {
         fan.mask = mask
         root.addSublayer(fan)
         // 状态栏按钮的图层坐标向下增长，保留右下角对齐。 / The status button's layer coordinates grow downward; keep the badge bottom-right.
-        badge.frame = CGRect(x: 12, y: 12, width: 9, height: 9)
+        badge.frame = CGRect(x: 9, y: 9, width: 12, height: 12)
         badge.contents = MenuBarStatusArtwork.badgeImage
         root.addSublayer(badge)
     }
@@ -175,18 +175,18 @@ enum MenuBarStatusArtwork {
         .withSymbolConfiguration(.init(pointSize: 18, weight: .medium))?
         .cgImage(forProposedRect: nil, context: nil, hints: nil)
     private static let sleepBadge = NSImage(systemSymbolName: "infinity.circle.fill", accessibilityDescription: nil)?
-        .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))?
+        .withSymbolConfiguration(.init(pointSize: 12, weight: .bold))?
         .cgImage(forProposedRect: nil, context: nil, hints: nil)
     fileprivate static let badgeImage: CGImage? = {
-        guard let sleepBadge, let bitmap = CGContext(data: nil, width: 18, height: 18, bitsPerComponent: 8,
+        guard let sleepBadge, let bitmap = CGContext(data: nil, width: 24, height: 24, bitsPerComponent: 8,
             bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         bitmap.scaleBy(x: 2, y: 2)
         bitmap.setFillColor(NSColor.white.cgColor)
-        bitmap.fillEllipse(in: CGRect(x: 1, y: 1, width: 7, height: 7))
+        bitmap.fillEllipse(in: CGRect(x: 4.0 / 3.0, y: 4.0 / 3.0, width: 28.0 / 3.0, height: 28.0 / 3.0))
         bitmap.saveGState()
-        bitmap.clip(to: CGRect(x: 0, y: 0, width: 9, height: 9), mask: sleepBadge)
+        bitmap.clip(to: CGRect(x: 0, y: 0, width: 12, height: 12), mask: sleepBadge)
         bitmap.setFillColor(NSColor.systemRed.cgColor)
-        bitmap.fill(CGRect(x: 0, y: 0, width: 9, height: 9))
+        bitmap.fill(CGRect(x: 0, y: 0, width: 12, height: 12))
         bitmap.restoreGState()
         return bitmap.makeImage()
     }()
@@ -228,9 +228,9 @@ enum MenuBarStatusArtwork {
             bitmap.fill(CGRect(x: -9, y: -9, width: 18, height: 18))
             bitmap.restoreGState()
             if sleepOn, let badge = sleepBadge {
-                let rect = CGRect(x: 12, y: 1, width: 9, height: 9)
+                let rect = CGRect(x: 9, y: 1, width: 12, height: 12)
                 bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
-                bitmap.fillEllipse(in: rect.insetBy(dx: 1, dy: 1))
+                bitmap.fillEllipse(in: rect.insetBy(dx: 4.0 / 3.0, dy: 4.0 / 3.0))
                 bitmap.saveGState()
                 bitmap.clip(to: rect, mask: badge)
                 bitmap.setFillColor(NSColor.systemRed.cgColor)

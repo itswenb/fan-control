@@ -219,6 +219,10 @@ final class AppStore {
     }
     @ObservationIgnored private var startupRestoreAttempts = 0
     @ObservationIgnored private var lastRestoreSample: Date?
+    @ObservationIgnored private var staleWriteRetry = false
+    @ObservationIgnored private var nextStaleWriteRetry: TimeInterval = 0
+    @ObservationIgnored private var userControlEpoch = 0
+    @ObservationIgnored private var pendingAutomaticIntent = false
     @ObservationIgnored private let repository: PresetRepository
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let helper: any ControlServiceConnection
@@ -566,11 +570,11 @@ final class AppStore {
         controlActivity = nil
     }
 
-    func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom") async throws {
+    func apply(_ newPolicies: [FanPolicy], presetID: UUID? = nil, builtIn: String = "custom", isRecovery: Bool = false) async throws {
         guard canControl, var snapshot else { throw ControlError.readOnly }
         controlPending = true
         defer { controlPending = false }
-        let expectedGeneration = generation
+        let expectedGeneration = generation, expectedUserControlEpoch = userControlEpoch
         let temperatureSources = try ControlTemperatureSource.resolve(newPolicies, in: snapshot)
         let date = Date()
         let needsFreshFans = newPolicies.contains { policy in
@@ -580,7 +584,8 @@ final class AppStore {
         if !detailedMonitoring && (needsFreshFans || needsFreshSensors) {
             // 后台按用户操作补读所选策略需要的数据，不恢复完整持续采样。
             let reading = try await sampleForControl(temperatureSources)
-            guard generation == expectedGeneration, !isSuspended, helperAvailable, !recoveryUnconfirmed else { throw ControlError.readOnly }
+            guard generation == expectedGeneration, userControlEpoch == expectedUserControlEpoch,
+                  !isSuspended, helperAvailable, !recoveryUnconfirmed else { throw ControlError.readOnly }
             snapshot = mergeMonitoringReadings(reading)
             self.snapshot = snapshot
             now = Date()
@@ -588,6 +593,7 @@ final class AppStore {
         try PolicyValidator.validate(newPolicies, in: snapshot, at: Date())
         startupRestorePending = false
         controlRevision += 1
+        let expectedRevision = controlRevision
         let expected = newPolicies.contains(where: { $0.mode != .automatic }) ? newPolicies : []
         do {
             let reply = try await helper.request(HelperRequest(operation: .apply, policies: newPolicies,
@@ -595,11 +601,26 @@ final class AppStore {
             guard reply.status?.recoveryBlocked == false, reply.status?.policies == expected else { throw SessionError.recoveryRequired }
         } catch {
             if let error = error as? HelperClientError, case .readingsNotReady = error { throw error }
+            if let error = error as? HelperClientError, case .confirmedWriteStale = error {
+                if controlRevision == expectedRevision && !isRecovery {
+                    lastControl = LastControlConfiguration(model: snapshot.model, policies: newPolicies,
+                                                           presetID: presetID, fullSpeed: builtIn == "full")
+                    saveLastControl()
+                    startupRestoreAttempts = 0; lastRestoreSample = nil
+                    staleWriteRetry = true
+                    nextStaleWriteRetry = ProcessInfo.processInfo.systemUptime + 1
+                    startupRestorePending = true
+                }
+                recoveryUnconfirmed = true
+                throw error
+            }
             helper.disconnect()
             recoveryUnconfirmed = true
             helperAvailable = false
             throw error
         }
+        guard controlRevision == expectedRevision else { throw HelperClientError.disconnected }
+        staleWriteRetry = false
         policies = newPolicies
         displayPolicies = expected
         helperSessionKnown = true
@@ -658,14 +679,25 @@ final class AppStore {
     }
 
     func restoreAutomatic() {
-        guard !controlPending else { return }
-        guard helperAvailable || recoveryUnconfirmed else { showControlSetup = true; return }
-        if !hasCustomControl && !recoveryUnconfirmed && snapshot?.fans.contains(where: { $0.mode == .fixed }) == true {
+        guard helperAvailable || recoveryUnconfirmed || controlPending else { showControlSetup = true; return }
+        if !controlPending && !hasCustomControl && !recoveryUnconfirmed && snapshot?.fans.contains(where: { $0.mode == .fixed }) == true {
             alertMessage = text("请先在其他风扇工具中恢复自动并退出该工具，再使用 Fan Control 调速。", "Restore automatic mode in the other fan utility and quit it before using Fan Control.")
             return
         }
         startupRestorePending = false
-        Task { do { try await restoreHardware(rememberSelection: true) } catch { alertMessage = error.localizedDescription } }
+        staleWriteRetry = false
+        userControlEpoch += 1
+        controlRevision += 1
+        pendingAutomaticIntent = true
+        if let snapshot {
+            lastControl = LastControlConfiguration(model: snapshot.model, policies: [], presetID: nil, fullSpeed: false)
+            saveLastControl()
+        }
+        if controlPending { helper.disconnect() }
+        Task {
+            defer { pendingAutomaticIntent = false }
+            do { try await restoreHardware(rememberSelection: true) } catch { alertMessage = error.localizedDescription }
+        }
     }
 
     func savePreset(name: String, customPolicies: [FanPolicy]? = nil) throws {
@@ -803,11 +835,13 @@ final class AppStore {
                     record(message, error: true)
                 }
                 let wasControlling = hasCustomControl
-                if wasControlling, !reply.ownsSession, status.owner == nil,
+                if !pendingAutomaticIntent, wasControlling, !reply.ownsSession, status.owner == nil,
                    status.recoveryReason?.permitsAutomaticResume == true {
                     startupRestorePending = true
                     startupRestoreAttempts = 0
                     lastRestoreSample = nil
+                    staleWriteRetry = status.recoveryReason == .postWriteStale
+                    nextStaleWriteRetry = ProcessInfo.processInfo.systemUptime + (staleWriteRetry ? 1 : 0)
                 }
                 let ownedPolicies = reply.ownsSession ? status.policies : []
                 if policies != ownedPolicies { policies = ownedPolicies }
@@ -852,7 +886,7 @@ final class AppStore {
               defaults.string(forKey: "automaticHelperRepairAttemptedBuild") != identity else { return }
         if let clientError = error as? HelperClientError {
             switch clientError {
-            case .timeout, .remote, .readingsNotReady: return
+            case .timeout, .remote, .readingsNotReady, .confirmedWriteStale: return
             case .disconnected: break
             }
         }
@@ -942,6 +976,7 @@ final class AppStore {
 
     private func restoreLastControlIfNeeded() async {
         guard startupRestorePending, canControl, let snapshot else { return }
+        if staleWriteRetry && ProcessInfo.processInfo.systemUptime < nextStaleWriteRetry { return }
         guard let lastControl, lastControl.policies.contains(where: { $0.mode != .automatic }) else {
             startupRestorePending = false
             return
@@ -953,6 +988,7 @@ final class AppStore {
             try lastControl.validateForResume(in: snapshot, at: Date())
         } catch {
             startupRestoreAttempts += 1
+            if staleWriteRetry { nextStaleWriteRetry = ProcessInfo.processInfo.systemUptime + min(4, pow(2, Double(startupRestoreAttempts - 1))) }
             if startupRestoreAttempts >= 3 {
                 startupRestorePending = false
                 let message = text("上次策略未自动恢复：", "Last policy was not resumed: ") + error.localizedDescription
@@ -966,14 +1002,18 @@ final class AppStore {
         let selection = PresetSelection.resolve(policies: lastControl.policies, in: snapshot, presets: presets,
                                                 preferredID: lastControl.presetID, preferFullSpeed: lastControl.fullSpeed)
         let id: UUID? = if case .preset(let id) = selection { id } else { nil }
+        let retryEpoch = userControlEpoch, retryGeneration = generation
         do {
-            try await apply(lastControl.policies, presetID: id, builtIn: selection == .fullSpeed ? "full" : "custom")
+            try await apply(lastControl.policies, presetID: id, builtIn: selection == .fullSpeed ? "full" : "custom", isRecovery: true)
+            staleWriteRetry = false
             record(text("已恢复上次使用的策略。", "Resumed the last selected policy."))
         } catch {
+            guard userControlEpoch == retryEpoch, generation == retryGeneration, !isSuspended else { return }
             if let clientError = error as? HelperClientError {
                 switch clientError {
-                case .readingsNotReady, .timeout, .disconnected:
+                case .readingsNotReady, .timeout, .disconnected, .confirmedWriteStale:
                     startupRestoreAttempts += 1
+                    if staleWriteRetry { nextStaleWriteRetry = ProcessInfo.processInfo.systemUptime + min(4, pow(2, Double(startupRestoreAttempts - 1))) }
                     if startupRestoreAttempts < 3 {
                         // 未确认的写入必须等状态查询解除恢复阻塞；Wait for confirmed recovery before retrying.
                         startupRestorePending = true

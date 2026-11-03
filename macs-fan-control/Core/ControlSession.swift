@@ -13,11 +13,11 @@ public protocol ControlJournal: AnyObject {
 }
 
 public enum RecoveryReason: String, Codable, Sendable {
-    case requested, heartbeatExpired, samplingInterrupted, disconnected, serviceRestarted, thermalEmergency, controlFailure
+    case requested, heartbeatExpired, samplingInterrupted, postWriteStale, disconnected, serviceRestarted, thermalEmergency, controlFailure
 
     public var permitsAutomaticResume: Bool {
         switch self {
-        case .heartbeatExpired, .samplingInterrupted, .disconnected, .serviceRestarted: true
+        case .heartbeatExpired, .samplingInterrupted, .postWriteStale, .disconnected, .serviceRestarted: true
         case .requested, .thermalEmergency, .controlFailure: false
         }
     }
@@ -39,7 +39,7 @@ public struct SessionStatus: Codable, Sendable {
 }
 
 public enum SessionError: Error, LocalizedError {
-    case busy, recoveryRequired, externallyControlled, notOwner, readingsNotReady
+    case busy, recoveryRequired, externallyControlled, notOwner, readingsNotReady, confirmedWriteStale
     public var errorDescription: String? {
         switch self {
         case .busy: "另一个会话正在控制风扇。"
@@ -47,13 +47,18 @@ public enum SessionError: Error, LocalizedError {
         case .externallyControlled: "风扇正在被其他控制器接管，或模式无法确认。请先恢复系统自动。"
         case .notOwner: "当前连接不是风扇控制会话的所有者。"
         case .readingsNotReady: "控制服务尚未读到有效温度，未写入风扇策略。"
+        case .confirmedWriteStale: "风扇写入已确认，但温度已过期；等待系统自动确认后使用新读数重试。"
         }
     }
 }
 
+private struct ConfirmedWriteStale: Error {}
+private struct ExternalFanTakeover: Error { let fans: Set<String> }
+
 public final class ControlSession {
     private let driver: any FanControlDriver
     private let journal: any ControlJournal
+    private let clock: () -> Date
     private var owner: UUID?
     private var policies: [FanPolicy] = []
     private var temperatureSources: [ControlTemperatureSource] = []
@@ -74,8 +79,8 @@ public final class ControlSession {
                       recoveryBlocked: !pending.isEmpty || journalFailure, recoveryReason: recoveryReason)
     }
 
-    public init(driver: any FanControlDriver, journal: any ControlJournal) throws {
-        self.driver = driver; self.journal = journal
+    public init(driver: any FanControlDriver, journal: any ControlJournal, clock: @escaping () -> Date = Date.init) throws {
+        self.driver = driver; self.journal = journal; self.clock = clock
         touched = try journal.load()
         if !touched.isEmpty { recover(reason: "控制服务重新启动，恢复上次接管的风扇。", cause: .serviceRestarted) }
     }
@@ -86,7 +91,8 @@ public final class ControlSession {
     }
 
     public func apply(_ requested: [FanPolicy], temperatureSources: [ControlTemperatureSource] = [],
-                      client: UUID, uptime: TimeInterval, now: Date) throws {
+                      client: UUID, uptime: TimeInterval, now: Date, ownerConnected: () -> Bool = { true }) throws {
+        guard ownerConnected() else { throw SessionError.notOwner }
         guard removalOwner == nil else { throw SessionError.busy }
         guard owner == nil || owner == client else { throw SessionError.busy }
         guard pending.isEmpty, !journalFailure else { throw SessionError.recoveryRequired }
@@ -119,11 +125,18 @@ public final class ControlSession {
         recoveryReason = nil
         samplingFallback = false
         do {
-            for id in touched.subtracting(toControl) { try driver.restoreAutomatic(fanID: id) }
+            for id in touched.subtracting(toControl) {
+                guard ownerConnected() else { throw SessionError.notOwner }
+                try driver.restoreAutomatic(fanID: id)
+            }
             touched = toControl
-            try update(snapshot: snapshot, now: now)
+            try update(snapshot: snapshot, now: now, ownerConnected: ownerConnected)
             try journal.save(touched)
             if touched.isEmpty { owner = nil; policies = []; self.temperatureSources = [] }
+        } catch is ConfirmedWriteStale {
+            touched = recoverySet
+            recover(reason: SessionError.confirmedWriteStale.localizedDescription, cause: .postWriteStale)
+            throw SessionError.confirmedWriteStale
         } catch {
             // 包含本次所有可能触达的风扇，不能只回滚最后一次成功写入。
             touched = recoverySet
@@ -148,14 +161,35 @@ public final class ControlSession {
             recover(reason: "客户端心跳超时（\(gap) 秒），恢复系统控制。", cause: .heartbeatExpired)
             return
         }
+        var lastSnapshot: HardwareSnapshot?
         do {
             // 定时任务的调度间隔不能证明硬件或采样失效。延迟后读取当前状态，
             // 再验证温度新鲜度及控制权，避免健康会话先恢复自动再重新应用策略。
             let snapshot = try driver.controlSnapshot(temperatureSources: temperatureSources)
+            lastSnapshot = snapshot
             try PolicyValidator.validate(policies, in: snapshot, at: max(now, snapshot.timestamp))
             try verifyOwnership(in: snapshot)
-            try update(snapshot: snapshot, now: now)
+            try update(snapshot: snapshot, now: now, ownerConnected: ownerConnected)
             if samplingFallback { samplingFallback = false; message = nil }
+        } catch is ConfirmedWriteStale {
+            do {
+                if let lastSnapshot, try allFansConfirmedMaximum(in: lastSnapshot, ownerConnected: ownerConnected) {
+                    samplingFallback = true
+                    message = "温度已过期，风扇保持全速；等待新读数。"
+                } else {
+                    recover(reason: SessionError.confirmedWriteStale.localizedDescription, cause: .postWriteStale)
+                }
+            } catch let takeover as ExternalFanTakeover {
+                recoverWithoutTakingOver(takeover.fans)
+            } catch SessionError.externallyControlled {
+                recover(reason: SessionError.externallyControlled.localizedDescription)
+            } catch SessionError.notOwner {
+                recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected)
+            } catch {
+                recover(reason: SessionError.confirmedWriteStale.localizedDescription, cause: .postWriteStale)
+            }
+        } catch SessionError.notOwner {
+            recover(reason: "客户端连接中断，恢复系统自动。", cause: .disconnected)
         } catch ControlError.samplingInterrupted {
             guard policies.contains(where: { $0.mode == .sensor }) else {
                 recover(reason: ControlError.samplingInterrupted.localizedDescription, cause: .samplingInterrupted)
@@ -196,9 +230,11 @@ public final class ControlSession {
         removalOwner = nil
     }
 
-    private func update(snapshot: HardwareSnapshot, now: Date) throws {
+    private func update(snapshot: HardwareSnapshot, now: Date, ownerConnected: () -> Bool) throws {
+        var wroteInCycle = false
         for policy in policies where policy.mode != .automatic {
-            try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, Date()))
+            do { try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, clock())) }
+            catch ControlError.staleSensor where wroteInCycle { throw ConfirmedWriteStale() }
             guard let fan = snapshot.fans.first(where: { $0.id == policy.fanID }) else { throw ControlError.missingFan }
             let sensor = snapshot.sensors.first { $0.id == policy.sensorID }
             guard let target = PolicyValidator.target(for: policy, fan: fan, temperature: sensor?.celsius) else { throw ControlError.invalidRPM }
@@ -207,9 +243,54 @@ public final class ControlSession {
             ramps[fan.id] = ramp
             // 所有权已在本轮读取中核对；目标未变化时无需再次写入和等待 SMC 锁存。
             if confirmedTargets[fan.id] == commanded { continue }
+            guard ownerConnected() else { throw SessionError.notOwner }
             try driver.setTarget(fanID: fan.id, rpm: commanded)
-            try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, Date()))
             confirmedTargets[fan.id] = commanded
+            guard ownerConnected() else { throw SessionError.notOwner }
+            wroteInCycle = true
+            do { try PolicyValidator.validate([policy], in: snapshot, at: max(now, snapshot.timestamp, clock())) }
+            catch ControlError.staleSensor { throw ConfirmedWriteStale() }
+        }
+    }
+
+    /// 仅在全部风扇重新读回全速时保留控制。 / Keep control only after every fan is freshly confirmed at maximum.
+    private func allFansConfirmedMaximum(in previous: HardwareSnapshot, ownerConnected: () -> Bool) throws -> Bool {
+        guard !touched.isEmpty, touched.allSatisfy({ id in
+            guard let fan = previous.fans.first(where: { $0.id == id }), let maximum = fan.validRange?.upperBound,
+                  let target = confirmedTargets[id] else { return false }
+            return abs(target - maximum) <= 1
+        }) else { return false }
+        guard ownerConnected() else { throw SessionError.notOwner }
+        let fresh = try driver.controlSnapshot(temperatureSources: [])
+        guard ownerConnected() else { throw SessionError.notOwner }
+        let external = Set(touched.filter { id in
+            guard let fan = fresh.fans.first(where: { $0.id == id }), let mode = fan.mode else { return false }
+            if mode != .fixed { return true }
+            guard let actual = fan.target, actual.isFinite, let expected = confirmedTargets[id] else { return false }
+            return abs(actual - expected) > 1
+        })
+        if !external.isEmpty { throw ExternalFanTakeover(fans: external) }
+        try verifyOwnership(in: fresh)
+        return touched.allSatisfy { id in
+            guard let fan = fresh.fans.first(where: { $0.id == id }), fan.isFresh(at: Date()), fan.controlSupported,
+                  let maximum = fan.validRange?.upperBound, let target = fan.target else { return false }
+            return abs(target - maximum) <= 1
+        }
+    }
+
+    /// 放弃已确认被接管的风扇，先更新日志再恢复其余风扇。 / Forget confirmed external ownership before restoring the remaining fans.
+    private func recoverWithoutTakingOver(_ external: Set<String>) {
+        let remaining = touched.subtracting(external)
+        do {
+            try journal.save(remaining)
+            touched = remaining
+            recover(reason: SessionError.externallyControlled.localizedDescription)
+        } catch {
+            touched = remaining; pending = remaining
+            policies = []; temperatureSources = []; ramps = [:]; confirmedTargets = [:]
+            samplingFallback = false; recoveryReason = .controlFailure
+            journalFailure = true; retriesRemaining = 4
+            message = "控制权已被其他程序接管，恢复日志写入失败。"
         }
     }
 

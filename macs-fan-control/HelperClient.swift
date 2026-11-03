@@ -125,7 +125,8 @@ final class HelperClient: ControlServiceConnection {
         let connection = try connect()
         guard let connectionID else { throw HelperClientError.disconnected }
         let id = UUID()
-        let timeout: TimeInterval = request.operation == .heartbeat || request.operation == .sleepHeartbeat ? 15 : 5
+        let timeout: TimeInterval = request.operation == .apply ? 30 :
+            (request.operation == .heartbeat || request.operation == .sleepHeartbeat ? 15 : 5)
         let deadline = RequestDeadline(deadline: ProcessInfo.processInfo.systemUptime + timeout)
         let response: HelperReply = try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
@@ -166,6 +167,7 @@ final class HelperClient: ControlServiceConnection {
         if let error = response.error {
             if request.operation.isSleepOperation { diagnostics?.event("xpc", "remote.error", "operation=\(request.operation.rawValue) message=\(error)", error: true) }
             if request.operation == .apply, response.readingsNotReady == true { throw HelperClientError.readingsNotReady }
+            if request.operation == .apply, response.confirmedWriteStale == true { throw HelperClientError.confirmedWriteStale }
             throw HelperClientError.remote(error)
         }
         return response
@@ -211,13 +213,14 @@ final class HelperClient: ControlServiceConnection {
 }
 
 enum HelperClientError: Error, LocalizedError {
-    case timeout, disconnected, remote(String), readingsNotReady
+    case timeout, disconnected, remote(String), readingsNotReady, confirmedWriteStale
     var errorDescription: String? {
         switch self {
         case .timeout: "控制服务响应超时，硬件状态未确认。"
         case .disconnected: "控制服务连接中断，等待服务恢复系统控制。"
         case .remote(let message): message
         case .readingsNotReady: SessionError.readingsNotReady.localizedDescription
+        case .confirmedWriteStale: SessionError.confirmedWriteStale.localizedDescription
         }
     }
 }

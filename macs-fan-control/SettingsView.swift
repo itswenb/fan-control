@@ -150,7 +150,7 @@ struct MenuBarView: View {
             }.disabled(store.controlPending)
             Spacer()
             Button(store.text("恢复自动", "Restore Automatic")) { store.restoreAutomatic() }
-                .disabled((!store.hasCustomControl && !store.recoveryUnconfirmed) || store.controlPending)
+                .disabled(!store.hasCustomControl && !store.recoveryUnconfirmed && !store.controlPending)
             }
             Toggle(store.text("禁止休眠（含合盖）", "Prevent sleep (including lid close)"), isOn: Binding(
                 get: { store.sleepControl.isOn },
